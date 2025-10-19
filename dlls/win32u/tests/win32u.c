@@ -1304,6 +1304,15 @@ static void test_NtUserDisplayConfigGetDeviceInfo(void)
     source_name.header.id = 0;
     status = NtUserDisplayConfigGetDeviceInfo(&source_name.header);
     ok(status == STATUS_UNSUCCESSFUL || status == STATUS_NOT_SUPPORTED, "got %#lx.\n", status);
+
+    DISPLAYCONFIG_SDR_WHITE_LEVEL white_level;
+    white_level.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    white_level.header.size = sizeof(source_name.header);
+    source_name.header.adapterId.LowPart = 0xFFFF;
+    source_name.header.adapterId.HighPart = 0xFFFF;
+    white_level.header.id = 0;
+    status = NtUserDisplayConfigGetDeviceInfo(&white_level.header);
+    ok(status == STATUS_NOT_SUPPORTED, "got %#lx.\n", status);
 }
 
 static LRESULT WINAPI test_ipc_message_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
