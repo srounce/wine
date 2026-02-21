@@ -23,7 +23,6 @@
 #include "initguid.h"
 #include "ole2.h"
 #include "wincodec.h"
-#include "winbase.h"
 
 #define BCDEC_IMPLEMENTATION
 #include "bcdec.h"
@@ -861,6 +860,7 @@ static const GUID *wic_container_guid_from_d3dx_file_format(enum d3dx_image_file
         case D3DX_IMAGE_FILE_FORMAT_TIFF: return &GUID_ContainerFormatTiff;
         case D3DX_IMAGE_FILE_FORMAT_GIF:  return &GUID_ContainerFormatGif;
         case D3DX_IMAGE_FILE_FORMAT_WMP:  return &GUID_ContainerFormatWmp;
+        case D3DX_IMAGE_FILE_FORMAT_ICO:  return &GUID_ContainerFormatIco;
         default:
             assert(0 && "Unexpected file format.");
             return NULL;
@@ -1153,6 +1153,8 @@ static const uint8_t gif_87a_file_signature[] =  { 'G', 'I', 'F', '8', '7', 'a' 
 static const uint8_t gif_89a_file_signature[] =  { 'G', 'I', 'F', '8', '9', 'a' };
 static const uint8_t wmp_v0_file_signature[] =   { 'I', 'I', 0xbc, 0x00 };
 static const uint8_t wmp_v1_file_signature[] =   { 'I', 'I', 0xbc, 0x01 };
+static const uint8_t ico_file_signature[] =      { 0x0, 0x0, 0x01, 0x00 };
+static const uint8_t cur_file_signature[] =      { 0x0, 0x0, 0x02, 0x00 };
 
 /*
  * If none of these match, the file is either DIB, TGA, or something we don't
@@ -1182,95 +1184,9 @@ static const struct d3dx_file_format_signature file_format_signatures[] =
     { gif_89a_file_signature,   sizeof(gif_89a_file_signature),   D3DX_IMAGE_FILE_FORMAT_GIF },
     { wmp_v0_file_signature,    sizeof(wmp_v0_file_signature),    D3DX_IMAGE_FILE_FORMAT_WMP },
     { wmp_v1_file_signature,    sizeof(wmp_v1_file_signature),    D3DX_IMAGE_FILE_FORMAT_WMP },
+    { ico_file_signature,       sizeof(ico_file_signature),    D3DX_IMAGE_FILE_FORMAT_ICO },
+    { cur_file_signature,       sizeof(cur_file_signature),    D3DX_IMAGE_FILE_FORMAT_ICO },
 };
-
-static BOOL d3dx_extract_ico_entry(const void *src_data, uint32_t src_data_size,
-        const void **out_data, uint32_t *out_size)
-{
-    const BYTE *data = src_data;
-    uint16_t reserved, type, count;
-    uint32_t offset, size;
-
-    if (src_data_size < 6 + 16)
-    {
-        WARN("ico_entry: too small size %u.\n", src_data_size);
-        return FALSE;
-    }
-
-    reserved = data[0] | (data[1] << 8);
-    type = data[2] | (data[3] << 8);
-    count = data[4] | (data[5] << 8);
-
-    TRACE("ico_entry: reserved %u, type %u, count %u.\n", reserved, type, count);
-
-    if (reserved || (type != 1 && type != 2) || !count)
-        return FALSE;
-
-    offset = data[6 + 12] | (data[6 + 13] << 8) | (data[6 + 14] << 16) | (data[6 + 15] << 24);
-    size = data[6 + 8] | (data[6 + 9] << 8) | (data[6 + 10] << 16) | (data[6 + 11] << 24);
-
-    TRACE("ico_entry: offset %u, size %u, total %u.\n", offset, size, src_data_size);
-
-    if (!size || offset >= src_data_size || (offset + size) > src_data_size)
-        return FALSE;
-
-    *out_data = data + offset;
-    *out_size = size;
-    return TRUE;
-}
-
-static BOOL d3dx_fixup_ico_dib(const void *src_data, uint32_t src_data_size,
-        const void **out_data, uint32_t *out_size)
-{
-    const BITMAPINFOHEADER *src_info = src_data;
-    uint32_t header_size, palette_count, palette_bytes, extra_mask_bytes;
-    uint32_t row_pitch, color_size, total_needed;
-    int32_t width, height;
-    BYTE *buf;
-
-    if (src_data_size < sizeof(*src_info))
-        return FALSE;
-
-    header_size = src_info->biSize;
-    if (header_size < sizeof(BITMAPINFOHEADER) || src_data_size < header_size)
-        return FALSE;
-
-    width = src_info->biWidth;
-    height = src_info->biHeight;
-    if (width <= 0 || height <= 0 || (height & 1))
-        return FALSE;
-
-    extra_mask_bytes = 0;
-    if (src_info->biSize == sizeof(BITMAPINFOHEADER) && src_info->biCompression == BI_BITFIELDS)
-        extra_mask_bytes = 3 * sizeof(DWORD);
-
-    palette_count = src_info->biClrUsed;
-    if (!palette_count && src_info->biBitCount <= 8)
-        palette_count = 1u << src_info->biBitCount;
-    palette_bytes = palette_count * sizeof(RGBQUAD);
-
-    row_pitch = ((width * src_info->biBitCount + 31) / 32) * 4;
-    color_size = row_pitch * (height / 2);
-
-    total_needed = header_size + extra_mask_bytes + palette_bytes + color_size;
-    if (src_data_size < total_needed)
-        return FALSE;
-
-    buf = malloc(total_needed);
-    if (!buf)
-        return FALSE;
-
-    memcpy(buf, src_data, total_needed);
-    {
-        BITMAPINFOHEADER *info = (BITMAPINFOHEADER *)buf;
-        info->biHeight = height / 2;
-        info->biSizeImage = color_size;
-    }
-
-    *out_data = buf;
-    *out_size = total_needed;
-    return TRUE;
-}
 
 static BOOL d3dx_get_image_file_format_from_file_signature(const void *src_data, uint32_t src_data_size,
         enum d3dx_image_file_format *out_iff)
@@ -1539,6 +1455,7 @@ const char *debug_d3dx_image_file_format(enum d3dx_image_file_format format)
         FMT_TO_STR(D3DX_IMAGE_FILE_FORMAT_DIB);
         FMT_TO_STR(D3DX_IMAGE_FILE_FORMAT_HDR);
         FMT_TO_STR(D3DX_IMAGE_FILE_FORMAT_PFM);
+        FMT_TO_STR(D3DX_IMAGE_FILE_FORMAT_ICO);
 #undef FMT_TO_STR
         default:
             return "unrecognized";
@@ -1625,81 +1542,6 @@ exit:
     return hr;
 }
 
-static HRESULT d3dx_initialize_image_from_bmp(const void *src_data, uint32_t src_data_size,
-        struct d3dx_image *image, uint32_t flags)
-{
-    const BITMAPFILEHEADER *file = src_data;
-    const BITMAPINFOHEADER *info;
-    uint32_t data_offset, header_size, row_pitch, slice_pitch;
-    int32_t width, height;
-    BOOL bottom_up;
-    BYTE *buffer;
-    const BYTE *pixels;
-    uint32_t y;
-
-    (void)flags;
-
-    if (src_data_size < sizeof(*file) + sizeof(*info))
-        return D3DX_ERROR_INVALID_DATA;
-    if (file->bfType != 0x4d42)
-        return D3DX_ERROR_INVALID_DATA;
-
-    data_offset = file->bfOffBits;
-    if (data_offset >= src_data_size)
-        return D3DX_ERROR_INVALID_DATA;
-
-    info = (const BITMAPINFOHEADER *)((const BYTE *)src_data + sizeof(*file));
-    header_size = info->biSize;
-    if (header_size < sizeof(*info) || (sizeof(*file) + header_size) > src_data_size)
-        return D3DX_ERROR_INVALID_DATA;
-
-    if (info->biCompression != BI_RGB)
-        return D3DX_ERROR_INVALID_DATA;
-
-    width = info->biWidth;
-    height = info->biHeight;
-    if (width <= 0 || height == 0)
-        return D3DX_ERROR_INVALID_DATA;
-
-    bottom_up = height > 0;
-    if (height < 0)
-        height = -height;
-
-    if (info->biBitCount == 32)
-        image->format = D3DX_PIXEL_FORMAT_B8G8R8A8_UNORM;
-    else if (info->biBitCount == 24)
-        image->format = D3DX_PIXEL_FORMAT_B8G8R8_UNORM;
-    else
-        return D3DX_ERROR_INVALID_DATA;
-
-    row_pitch = ((width * info->biBitCount + 31) / 32) * 4;
-    slice_pitch = row_pitch * height;
-    if ((data_offset + slice_pitch) > src_data_size)
-        return D3DX_ERROR_INVALID_DATA;
-
-    if (!(buffer = malloc(slice_pitch)))
-        return E_OUTOFMEMORY;
-
-    pixels = (const BYTE *)src_data + data_offset;
-    for (y = 0; y < (uint32_t)height; ++y)
-    {
-        uint32_t src_y = bottom_up ? (height - 1 - y) : y;
-        memcpy(buffer + y * row_pitch, pixels + src_y * row_pitch, row_pitch);
-    }
-
-    image->image_file_format = D3DX_IMAGE_FILE_FORMAT_BMP;
-    image->size.width = width;
-    image->size.height = height;
-    image->size.depth = 1;
-    image->mip_levels = 1;
-    image->layer_count = 1;
-    image->resource_type = D3DX_RESOURCE_TYPE_TEXTURE_2D;
-    image->image_buf = image->pixels = buffer;
-    image->image_palette = image->palette = NULL;
-
-    return S_OK;
-}
-
 static HRESULT d3dx_initialize_image_from_wic(const void *src_data, uint32_t src_data_size,
         struct d3dx_image *image, enum d3dx_image_file_format d3dx_file_format, uint32_t flags)
 {
@@ -1714,11 +1556,7 @@ static HRESULT d3dx_initialize_image_from_wic(const void *src_data, uint32_t src
 
     hr = WICCreateImagingFactory_Proxy(WINCODEC_SDK_VERSION, &wic_factory);
     if (FAILED(hr))
-    {
-        if (d3dx_file_format == D3DX_IMAGE_FILE_FORMAT_BMP)
-            return d3dx_initialize_image_from_bmp(src_data, src_data_size, image, flags);
         return hr;
-    }
 
     hr = IWICImagingFactory_CreateDecoder(wic_factory, container_format_guid, NULL, &bitmap_decoder);
     if (FAILED(hr))
@@ -2043,36 +1881,6 @@ HRESULT d3dx_image_init(const void *src_data, uint32_t src_data_size, struct d3d
         uint32_t src_image_size = src_data_size;
         const void *src_image = src_data;
 
-        if (d3dx_extract_ico_entry(src_data, src_data_size, &src_image, &src_image_size))
-        {
-            if (src_image_size >= sizeof(png_file_signature)
-                    && !memcmp(src_image, png_file_signature, sizeof(png_file_signature)))
-            {
-                hr = d3dx_image_init(src_image, src_image_size, image, starting_mip_level, flags);
-                return hr;
-            }
-
-            {
-                const void *dib_data = NULL;
-                uint32_t dib_size = 0;
-
-                if (d3dx_fixup_ico_dib(src_image, src_image_size, &dib_data, &dib_size))
-                {
-                    const void *bmp_data = dib_data;
-                    unsigned int bmp_size = dib_size;
-
-                    if (convert_dib_to_bmp(&bmp_data, &bmp_size))
-                    {
-                        hr = d3dx_image_init(bmp_data, bmp_size, image, starting_mip_level, flags);
-                        free((void *)bmp_data);
-                        free((void *)dib_data);
-                        return hr;
-                    }
-                    free((void *)dib_data);
-                }
-            }
-        }
-
         /*
          * All file formats supported by d3dx10/d3dx11 are detectable by
          * file signature.
@@ -2082,8 +1890,6 @@ HRESULT d3dx_image_init(const void *src_data, uint32_t src_data_size, struct d3d
 
         if (convert_dib_to_bmp(&src_image, &src_image_size))
         {
-            TRACE("image_init: converted DIB to BMP, size %u -> %u.\n",
-                    src_data_size, src_image_size);
             hr = d3dx_image_init(src_image, src_image_size, image, starting_mip_level, flags);
             free((void *)src_image);
             if (SUCCEEDED(hr))
@@ -2098,10 +1904,6 @@ HRESULT d3dx_image_init(const void *src_data, uint32_t src_data_size, struct d3d
     switch (iff)
     {
         case D3DX_IMAGE_FILE_FORMAT_BMP:
-            hr = d3dx_initialize_image_from_bmp(src_data, src_data_size, image, flags);
-            if (FAILED(hr))
-                hr = d3dx_initialize_image_from_wic(src_data, src_data_size, image, iff, flags);
-            break;
         case D3DX_IMAGE_FILE_FORMAT_JPG:
         case D3DX_IMAGE_FILE_FORMAT_PNG:
             hr = d3dx_initialize_image_from_wic(src_data, src_data_size, image, iff, flags);
@@ -2143,6 +1945,10 @@ HRESULT d3dx_image_init(const void *src_data, uint32_t src_data_size, struct d3d
         case D3DX_IMAGE_FILE_FORMAT_FORCE_DWORD:
             ERR("Unrecognized file format.\n");
             hr = D3DX_ERROR_INVALID_DATA;
+            break;
+
+        case D3DX_IMAGE_FILE_FORMAT_ICO:
+            hr = d3dx_initialize_image_from_wic(src_data, src_data_size, image, iff, flags);
             break;
 
         default:

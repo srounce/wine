@@ -536,7 +536,7 @@ static HRESULT WINAPI IcoDecoder_Initialize(IWICBitmapDecoder *iface, IStream *p
     }
 
     if (This->header.idReserved != 0 ||
-        This->header.idType != 1)
+        This->header.idType != 1 && This->header.idType != 2)
     {
         hr = E_FAIL;
         goto end;

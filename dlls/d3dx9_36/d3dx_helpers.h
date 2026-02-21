@@ -266,6 +266,7 @@ enum d3dx_image_file_format
     D3DX_IMAGE_FILE_FORMAT_DIB  = 6,
     D3DX_IMAGE_FILE_FORMAT_HDR  = 7,
     D3DX_IMAGE_FILE_FORMAT_PFM  = 8,
+    D3DX_IMAGE_FILE_FORMAT_ICO  = 9,
     /* TIFF/GIF/WMP are only available on d3dx10/d3dx11. */
     D3DX_IMAGE_FILE_FORMAT_TIFF = 10,
     D3DX_IMAGE_FILE_FORMAT_GIF  = 11,
