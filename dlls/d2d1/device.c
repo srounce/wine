@@ -3218,8 +3218,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
     D2D1_RECT_F s, d;
     D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
     D2D1_SIZE_F size;
-    D2D1_RECT_F size_rect;
-    D2D1_RECT_F destination_bounds;
+    D2D1_RECT_F src_rect;
     struct d2d_brush *imageBrush;
     ID2D1Geometry* geometry = NULL;
     D2D1_MATRIX_3X2_F maskTransform;
@@ -3250,57 +3249,45 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
     TRACE("prev_transform  %s\n", debug_d2d_matrix3x2_f(&top_layer->prev_transform));
 
     TRACE("SetTarget successfull\n");
-
-
-    // Set layer opacity to brush properties
-    brush_desc.opacity = top_layer->params.opacity;
-    brush_desc.transform = identity;
-
-    // Copy from draw_bitmap
-    _size = ID2D1Bitmap1_GetSize(top_layer->offscreen_bitmap);
-    d2d_rect_set(&s, 0.0f, 0.0f, _size.width, _size.height);
-
-    d.left = 0.0f;
-    d.top = 0.0f;
-    d.right = s.right - s.left;
-    d.bottom = s.bottom - s.top;
-
-    brush_desc.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
-    brush_desc.transform._21 = 0.0f;
-    brush_desc.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush_desc.transform._11;
-    brush_desc.transform._12 = 0.0f;
-    brush_desc.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
-    brush_desc.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush_desc.transform._22;
-
-    bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
-    bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
-    bitmap_brush_desc.interpolationMode = 
-        d2d1_1_interp_mode_from_d2d1(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-
-    if (FAILED(hr = d2d_bitmap_brush_create(
-            context->factory, 
-            (ID2D1Bitmap*)top_layer->offscreen_bitmap,
-            &bitmap_brush_desc,
-            &brush_desc,
-            &imageBrush)))
-    {
-        ERR("Failed to create bitmap brush, hr %#lx.\n", hr);
-        return;
-    }
-
-    // Apply clip geometry and draw
     size = ID2D1Bitmap1_GetSize(top_layer->offscreen_bitmap);
-    d2d_rect_set(&size_rect, 0.0f, 0.0f, size.width, size.height);
-    d2d_rect_set(&destination_bounds, 0.0f, 0.0f, size.width, size.height);
-    d2d_rect_intersect(&destination_bounds, &top_layer->params.contentBounds);
+    d2d_rect_set(&src_rect, 0.0f, 0.0f, size.width, size.height);
 
-    TRACE("contentBounds: %s\n", debug_d2d_rect_f(&top_layer->params.contentBounds));
     TRACE("size of offscreen bitmap: %f, %f\n", size.width, size.height);
-    TRACE("destination: %s\n", debug_d2d_rect_f(&destination_bounds));
 
-    //d2d_device_context_PushAxisAlignedClip(iface, &destination_bounds,
-    //    top_layer.params.maskAntialiasMode);
     if (top_layer->params.geometricMask) {
+        brush_desc.opacity = top_layer->params.opacity;
+        brush_desc.transform = identity;
+        _size = ID2D1Bitmap1_GetSize(top_layer->offscreen_bitmap);
+        d2d_rect_set(&s, 0.0f, 0.0f, _size.width, _size.height);
+
+        d.left = 0.0f;
+        d.top = 0.0f;
+        d.right = s.right - s.left;
+        d.bottom = s.bottom - s.top;
+
+        brush_desc.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
+        brush_desc.transform._21 = 0.0f;
+        brush_desc.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush_desc.transform._11;
+        brush_desc.transform._12 = 0.0f;
+        brush_desc.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
+        brush_desc.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush_desc.transform._22;
+
+        bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
+        bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
+        bitmap_brush_desc.interpolationMode =
+            d2d1_1_interp_mode_from_d2d1(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+        if (FAILED(hr = d2d_bitmap_brush_create(
+                context->factory,
+                (ID2D1Bitmap*)top_layer->offscreen_bitmap,
+                &bitmap_brush_desc,
+                &brush_desc,
+                &imageBrush)))
+        {
+            ERR("Failed to create bitmap brush, hr %#lx.\n", hr);
+            return;
+        }
+
         maskTransform = top_layer->params.maskTransform;
         TRACE("maskTransform: %s\n", debug_d2d_matrix3x2_f(&maskTransform));
         d2d_matrix_multiply(&maskTransform, &top_layer->prev_transform);
@@ -3311,11 +3298,12 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
         );
 
     } else {
-        TRACE("Rectangle: %s\n", debug_d2d_rect_f(&size_rect));
-        TRACE("Draw whole bitmap for now...\n");
-        hr = ID2D1Factory_CreateRectangleGeometry(context->factory,
-            &size_rect,
-            (ID2D1RectangleGeometry**)&geometry);
+        TRACE("No geometric mask, draw whole bitmap directly.\n");
+        d2d_device_context_DrawBitmap(iface, (ID2D1Bitmap *)top_layer->offscreen_bitmap, NULL,
+                top_layer->params.opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src_rect);
+        d2d_device_context_SetTransform(iface, &current_transform);
+        ID2D1Layer_Release(&top_layer->ID2D1Layer_iface);
+        return;
     }
 
     if (hr != S_OK) {
@@ -3325,11 +3313,10 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
 
     d2d_device_context_FillGeometry(iface, 
             geometry,
-            &imageBrush->ID2D1Brush_iface, 
+            &imageBrush->ID2D1Brush_iface,
             NULL //top_layer->params.opacityBrush
         );
     ID2D1Geometry_Release(geometry);
-    
     ID2D1Brush_Release(&imageBrush->ID2D1Brush_iface);
 
     //d2d_device_context_PopAxisAlignedClip(iface);
