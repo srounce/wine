@@ -2718,16 +2718,20 @@ static BOOL d2d_geometry_fill_add_arc_triangle(struct d2d_geometry *geometry,
 
 static void d2d_geometry_cleanup(struct d2d_geometry *geometry)
 {
-    free(geometry->outline.arc_faces);
-    free(geometry->outline.arcs);
-    free(geometry->outline.bezier_faces);
-    free(geometry->outline.beziers);
-    free(geometry->outline.faces);
-    free(geometry->outline.vertices);
-    free(geometry->fill.arc_vertices);
-    free(geometry->fill.bezier_vertices);
-    free(geometry->fill.faces);
-    free(geometry->fill.vertices);
+    if (geometry->resource_owner == geometry)
+    {
+        d2d_geometry_cache_discard(geometry);
+        free(geometry->outline.arc_faces);
+        free(geometry->outline.arcs);
+        free(geometry->outline.bezier_faces);
+        free(geometry->outline.beziers);
+        free(geometry->outline.faces);
+        free(geometry->outline.vertices);
+        free(geometry->fill.arc_vertices);
+        free(geometry->fill.bezier_vertices);
+        free(geometry->fill.faces);
+        free(geometry->fill.vertices);
+    }
     ID2D1Factory_Release(geometry->factory);
 }
 
@@ -2737,7 +2741,37 @@ static void d2d_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *facto
     geometry->ID2D1Geometry_iface.lpVtbl = vtbl;
     geometry->refcount = 1;
     ID2D1Factory_AddRef(geometry->factory = factory);
+    geometry->resource_owner = geometry;
     geometry->transform = *transform;
+}
+
+void d2d_geometry_cache_discard(struct d2d_geometry *geometry)
+{
+    ID3D11Buffer *buffers[] =
+    {
+        geometry->cache.fill.ib,
+        geometry->cache.fill.vb,
+        geometry->cache.fill.bezier_vb,
+        geometry->cache.fill.arc_vb,
+        geometry->cache.outline.ib,
+        geometry->cache.outline.vb,
+        geometry->cache.outline.bezier_ib,
+        geometry->cache.outline.bezier_vb,
+        geometry->cache.outline.arc_ib,
+        geometry->cache.outline.arc_vb,
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(buffers); ++i)
+    {
+        if (buffers[i])
+            ID3D11Buffer_Release(buffers[i]);
+    }
+
+    if (geometry->cache.device)
+        ID3D11Device1_Release(geometry->cache.device);
+
+    memset(&geometry->cache, 0, sizeof(geometry->cache));
 }
 
 static inline struct d2d_geometry *impl_from_ID2D1GeometrySink(ID2D1GeometrySink *iface)
@@ -5001,16 +5035,6 @@ static ULONG STDMETHODCALLTYPE d2d_transformed_geometry_Release(ID2D1Transformed
 
     if (!refcount)
     {
-        geometry->outline.arc_faces = NULL;
-        geometry->outline.arcs = NULL;
-        geometry->outline.bezier_faces = NULL;
-        geometry->outline.beziers = NULL;
-        geometry->outline.faces = NULL;
-        geometry->outline.vertices = NULL;
-        geometry->fill.arc_vertices = NULL;
-        geometry->fill.bezier_vertices = NULL;
-        geometry->fill.faces = NULL;
-        geometry->fill.vertices = NULL;
         ID2D1Geometry_Release(geometry->u.transformed.src_geometry);
         d2d_geometry_cleanup(geometry);
         free(geometry);
@@ -5235,6 +5259,7 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
     d2d_matrix_multiply(&g, transform);
     d2d_geometry_init(geometry, factory, &g, (ID2D1GeometryVtbl *)&d2d_transformed_geometry_vtbl);
     ID2D1Geometry_AddRef(geometry->u.transformed.src_geometry = src_geometry);
+    geometry->resource_owner = src_impl->resource_owner;
     geometry->u.transformed.transform = *transform;
     geometry->fill = src_impl->fill;
     geometry->outline = src_impl->outline;

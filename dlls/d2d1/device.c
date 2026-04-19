@@ -156,6 +156,120 @@ static struct d2d_clip_stack* d2d_return_target_clip_stack(struct d2d_device_con
 static void d2d_device_context_push_layer_impl(ID2D1DeviceContext6 *iface,
         const D2D1_LAYER_PARAMETERS1 *layer_parameters, ID2D1Layer *layer);
 
+static struct d2d_geometry *d2d_geometry_resource_owner(const struct d2d_geometry *geometry)
+{
+    return geometry->resource_owner ? geometry->resource_owner : (struct d2d_geometry *)geometry;
+}
+
+static void d2d_geometry_prepare_cache_device(struct d2d_geometry *geometry, ID3D11Device1 *device)
+{
+    if (geometry->cache.device == device)
+        return;
+
+    d2d_geometry_cache_discard(geometry);
+    ID3D11Device1_AddRef(geometry->cache.device = device);
+}
+
+static HRESULT d2d_geometry_create_buffer(ID3D11Device1 *device, D3D11_BIND_FLAG bind_flags,
+        UINT byte_width, const void *data, ID3D11Buffer **buffer)
+{
+    D3D11_SUBRESOURCE_DATA buffer_data;
+    D3D11_BUFFER_DESC buffer_desc;
+
+    memset(&buffer_desc, 0, sizeof(buffer_desc));
+    buffer_desc.ByteWidth = byte_width;
+    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    buffer_desc.BindFlags = bind_flags;
+
+    buffer_data.pSysMem = data;
+    buffer_data.SysMemPitch = 0;
+    buffer_data.SysMemSlicePitch = 0;
+
+    return ID3D11Device1_CreateBuffer(device, &buffer_desc, &buffer_data, buffer);
+}
+
+static HRESULT d2d_geometry_require_fill_buffers(struct d2d_geometry *geometry, ID3D11Device1 *device)
+{
+    d2d_geometry_prepare_cache_device(geometry, device);
+
+    if (geometry->fill.face_count)
+    {
+        if (!geometry->cache.fill.ib
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_INDEX_BUFFER,
+                geometry->fill.face_count * sizeof(*geometry->fill.faces),
+                geometry->fill.faces, &geometry->cache.fill.ib)))
+            return E_FAIL;
+        if (!geometry->cache.fill.vb
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+                geometry->fill.vertex_count * sizeof(*geometry->fill.vertices),
+                geometry->fill.vertices, &geometry->cache.fill.vb)))
+            return E_FAIL;
+    }
+
+    if (geometry->fill.bezier_vertex_count && !geometry->cache.fill.bezier_vb
+            && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+            geometry->fill.bezier_vertex_count * sizeof(*geometry->fill.bezier_vertices),
+            geometry->fill.bezier_vertices, &geometry->cache.fill.bezier_vb)))
+        return E_FAIL;
+
+    if (geometry->fill.arc_vertex_count && !geometry->cache.fill.arc_vb
+            && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+            geometry->fill.arc_vertex_count * sizeof(*geometry->fill.arc_vertices),
+            geometry->fill.arc_vertices, &geometry->cache.fill.arc_vb)))
+        return E_FAIL;
+
+    return S_OK;
+}
+
+static HRESULT d2d_geometry_require_outline_buffers(struct d2d_geometry *geometry, ID3D11Device1 *device)
+{
+    d2d_geometry_prepare_cache_device(geometry, device);
+
+    if (geometry->outline.face_count)
+    {
+        if (!geometry->cache.outline.ib
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_INDEX_BUFFER,
+                geometry->outline.face_count * sizeof(*geometry->outline.faces),
+                geometry->outline.faces, &geometry->cache.outline.ib)))
+            return E_FAIL;
+        if (!geometry->cache.outline.vb
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+                geometry->outline.vertex_count * sizeof(*geometry->outline.vertices),
+                geometry->outline.vertices, &geometry->cache.outline.vb)))
+            return E_FAIL;
+    }
+
+    if (geometry->outline.bezier_face_count)
+    {
+        if (!geometry->cache.outline.bezier_ib
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_INDEX_BUFFER,
+                geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces),
+                geometry->outline.bezier_faces, &geometry->cache.outline.bezier_ib)))
+            return E_FAIL;
+        if (!geometry->cache.outline.bezier_vb
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+                geometry->outline.bezier_count * sizeof(*geometry->outline.beziers),
+                geometry->outline.beziers, &geometry->cache.outline.bezier_vb)))
+            return E_FAIL;
+    }
+
+    if (geometry->outline.arc_face_count)
+    {
+        if (!geometry->cache.outline.arc_ib
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_INDEX_BUFFER,
+                geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces),
+                geometry->outline.arc_faces, &geometry->cache.outline.arc_ib)))
+            return E_FAIL;
+        if (!geometry->cache.outline.arc_vb
+                && FAILED(d2d_geometry_create_buffer(device, D3D11_BIND_VERTEX_BUFFER,
+                geometry->outline.arc_count * sizeof(*geometry->outline.arcs),
+                geometry->outline.arcs, &geometry->cache.outline.arc_vb)))
+            return E_FAIL;
+    }
+
+    return S_OK;
+}
+
 
 static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
@@ -883,9 +997,7 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
 static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
 {
-    D3D11_SUBRESOURCE_DATA buffer_data;
-    D3D11_BUFFER_DESC buffer_desc;
-    ID3D11Buffer *ib, *vb;
+    struct d2d_geometry *resource_owner = d2d_geometry_resource_owner(geometry);
     HRESULT hr;
 
     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
@@ -900,104 +1012,32 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
         return;
     }
 
-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
-    buffer_desc.CPUAccessFlags = 0;
-    buffer_desc.MiscFlags = 0;
-
-    buffer_data.SysMemPitch = 0;
-    buffer_data.SysMemSlicePitch = 0;
+    if (FAILED(hr = d2d_geometry_require_outline_buffers(resource_owner, render_target->d3d_device)))
+    {
+        WARN("Failed to create outline geometry buffers, hr %#lx.\n", hr);
+        return;
+    }
 
     if (geometry->outline.face_count)
     {
-        buffer_desc.ByteWidth = geometry->outline.face_count * sizeof(*geometry->outline.faces);
-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.faces;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
-        {
-            WARN("Failed to create index buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        buffer_desc.ByteWidth = geometry->outline.vertex_count * sizeof(*geometry->outline.vertices);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.vertices;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
-            ID3D11Buffer_Release(ib);
-            return;
-        }
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
+        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, resource_owner->cache.outline.ib,
+                3 * geometry->outline.face_count, resource_owner->cache.outline.vb,
                 sizeof(*geometry->outline.vertices), brush, NULL);
-
-        ID3D11Buffer_Release(vb);
-        ID3D11Buffer_Release(ib);
     }
 
     if (geometry->outline.bezier_face_count)
     {
-        buffer_desc.ByteWidth = geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces);
-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.bezier_faces;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
-        {
-            WARN("Failed to create curves index buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        buffer_desc.ByteWidth = geometry->outline.bezier_count * sizeof(*geometry->outline.beziers);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.beziers;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
-            ID3D11Buffer_Release(ib);
-            return;
-        }
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
-                3 * geometry->outline.bezier_face_count, vb,
+        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, resource_owner->cache.outline.bezier_ib,
+                3 * geometry->outline.bezier_face_count, resource_owner->cache.outline.bezier_vb,
                 sizeof(*geometry->outline.beziers), brush, NULL);
-
-        ID3D11Buffer_Release(vb);
-        ID3D11Buffer_Release(ib);
     }
 
     if (geometry->outline.arc_face_count)
     {
-        buffer_desc.ByteWidth = geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces);
-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.arc_faces;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
-        {
-            WARN("Failed to create arcs index buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        buffer_desc.ByteWidth = geometry->outline.arc_count * sizeof(*geometry->outline.arcs);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->outline.arcs;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create arcs vertex buffer, hr %#lx.\n", hr);
-            ID3D11Buffer_Release(ib);
-            return;
-        }
-
         if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
-                    3 * geometry->outline.arc_face_count, vb,
+            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, resource_owner->cache.outline.arc_ib,
+                    3 * geometry->outline.arc_face_count, resource_owner->cache.outline.arc_vb,
                     sizeof(*geometry->outline.arcs), brush, NULL);
-
-        ID3D11Buffer_Release(vb);
-        ID3D11Buffer_Release(ib);
     }
 }
 
@@ -1034,17 +1074,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
-    D3D11_SUBRESOURCE_DATA buffer_data;
-    D3D11_BUFFER_DESC buffer_desc;
-    ID3D11Buffer *ib, *vb;
+    struct d2d_geometry *resource_owner = d2d_geometry_resource_owner(geometry);
     HRESULT hr;
-
-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
-    buffer_desc.CPUAccessFlags = 0;
-    buffer_desc.MiscFlags = 0;
-
-    buffer_data.SysMemPitch = 0;
-    buffer_data.SysMemSlicePitch = 0;
 
     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
     {
@@ -1058,71 +1089,32 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
         return;
     }
 
+    if (FAILED(hr = d2d_geometry_require_fill_buffers(resource_owner, render_target->d3d_device)))
+    {
+        WARN("Failed to create fill geometry buffers, hr %#lx.\n", hr);
+        return;
+    }
+
     if (geometry->fill.face_count)
     {
-        buffer_desc.ByteWidth = geometry->fill.face_count * sizeof(*geometry->fill.faces);
-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        buffer_data.pSysMem = geometry->fill.faces;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
-        {
-            WARN("Failed to create index buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        buffer_desc.ByteWidth = geometry->fill.vertex_count * sizeof(*geometry->fill.vertices);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->fill.vertices;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
-            ID3D11Buffer_Release(ib);
-            return;
-        }
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
+        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, resource_owner->cache.fill.ib,
+                3 * geometry->fill.face_count, resource_owner->cache.fill.vb,
                 sizeof(*geometry->fill.vertices), brush, opacity_brush);
-
-        ID3D11Buffer_Release(vb);
-        ID3D11Buffer_Release(ib);
     }
 
     if (geometry->fill.bezier_vertex_count)
     {
-        buffer_desc.ByteWidth = geometry->fill.bezier_vertex_count * sizeof(*geometry->fill.bezier_vertices);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->fill.bezier_vertices;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count, vb,
+        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count,
+                resource_owner->cache.fill.bezier_vb,
                 sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush);
-
-        ID3D11Buffer_Release(vb);
     }
 
     if (geometry->fill.arc_vertex_count)
     {
-        buffer_desc.ByteWidth = geometry->fill.arc_vertex_count * sizeof(*geometry->fill.arc_vertices);
-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer_data.pSysMem = geometry->fill.arc_vertices;
-
-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
-        {
-            ERR("Failed to create arc vertex buffer, hr %#lx.\n", hr);
-            return;
-        }
-
         if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
+            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count,
+                    resource_owner->cache.fill.arc_vb,
                     sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
-
-        ID3D11Buffer_Release(vb);
     }
 }
 

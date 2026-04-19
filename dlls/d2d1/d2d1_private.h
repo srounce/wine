@@ -521,12 +521,31 @@ struct d2d_curve_outline_vertex
     D2D1_POINT_2F prev, next;
 };
 
+struct d2d_geometry_fill_cache
+{
+    ID3D11Buffer *ib;
+    ID3D11Buffer *vb;
+    ID3D11Buffer *bezier_vb;
+    ID3D11Buffer *arc_vb;
+};
+
+struct d2d_geometry_outline_cache
+{
+    ID3D11Buffer *ib;
+    ID3D11Buffer *vb;
+    ID3D11Buffer *bezier_ib;
+    ID3D11Buffer *bezier_vb;
+    ID3D11Buffer *arc_ib;
+    ID3D11Buffer *arc_vb;
+};
+
 struct d2d_geometry
 {
     ID2D1Geometry ID2D1Geometry_iface;
     LONG refcount;
 
     ID2D1Factory *factory;
+    struct d2d_geometry *resource_owner;
 
     D2D_MATRIX_3X2_F transform;
 
@@ -574,6 +593,13 @@ struct d2d_geometry
         size_t arc_faces_size;
         size_t arc_face_count;
     } outline;
+
+    struct
+    {
+        ID3D11Device1 *device;
+        struct d2d_geometry_fill_cache fill;
+        struct d2d_geometry_outline_cache outline;
+    } cache;
 
     union
     {
@@ -629,6 +655,7 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
 HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
         D2D1_FILL_MODE fill_mode, ID2D1Geometry **src_geometries, unsigned int geometry_count);
 struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface);
+void d2d_geometry_cache_discard(struct d2d_geometry *geometry);
 
 struct d2d_device
 {
