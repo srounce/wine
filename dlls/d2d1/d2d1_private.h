@@ -213,6 +213,7 @@ struct d2d_device_context
     ID3D11Buffer *ib;
     unsigned int vb_stride;
     ID3D11Buffer *vb;
+    ID3D11Buffer *unit_vb;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
     ID3D11SamplerState *sampler_states

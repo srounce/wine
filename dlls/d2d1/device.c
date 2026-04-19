@@ -440,6 +440,7 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
         if (context->bs)
             ID3D11BlendState_Release(context->bs);
         ID3D11RasterizerState_Release(context->rs);
+        ID3D11Buffer_Release(context->unit_vb);
         ID3D11Buffer_Release(context->vb);
         ID3D11Buffer_Release(context->ib);
         ID3D11Buffer_Release(context->ps_cb);
@@ -1187,9 +1188,9 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
         const D2D1_RECT_F *src_rect, const D2D1_POINT_2F *offset,
         const D2D1_MATRIX_4X4_F *perspective_transform)
 {
-    D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
-    D2D1_BRUSH_PROPERTIES brush_desc;
-    struct d2d_brush *brush;
+    struct d2d_brush brush = {0};
+    D2D1_MATRIX_3X2_F geometry_transform;
+    struct d2d_bitmap *bitmap_impl;
     D2D1_SIZE_F size;
     D2D1_RECT_F s, d;
     HRESULT hr;
@@ -1228,26 +1229,41 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
         d.bottom += offset->y;
     }
 
-    bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
-    bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
-    bitmap_brush_desc.interpolationMode = interpolation_mode;
+    geometry_transform._11 = d.right - d.left;
+    geometry_transform._21 = 0.0f;
+    geometry_transform._31 = d.left;
+    geometry_transform._12 = 0.0f;
+    geometry_transform._22 = d.bottom - d.top;
+    geometry_transform._32 = d.top;
 
-    brush_desc.opacity = opacity;
-    brush_desc.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
-    brush_desc.transform._21 = 0.0f;
-    brush_desc.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush_desc.transform._11;
-    brush_desc.transform._12 = 0.0f;
-    brush_desc.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
-    brush_desc.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush_desc.transform._22;
+    bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap);
+    brush.type = D2D_BRUSH_TYPE_BITMAP;
+    brush.opacity = opacity;
+    brush.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
+    brush.transform._21 = 0.0f;
+    brush.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush.transform._11;
+    brush.transform._12 = 0.0f;
+    brush.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
+    brush.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush.transform._22;
+    brush.u.bitmap.bitmap = bitmap_impl;
+    brush.u.bitmap.extend_mode_x = D2D1_EXTEND_MODE_CLAMP;
+    brush.u.bitmap.extend_mode_y = D2D1_EXTEND_MODE_CLAMP;
+    brush.u.bitmap.interpolation_mode = interpolation_mode;
 
-    if (FAILED(hr = d2d_bitmap_brush_create(context->factory, bitmap, &bitmap_brush_desc, &brush_desc, &brush)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &geometry_transform, 0.0f)))
     {
-        ERR("Failed to create bitmap brush, hr %#lx.\n", hr);
+        WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         return;
     }
 
-    d2d_device_context_FillRectangle(&context->ID2D1DeviceContext6_iface, &d, &brush->ID2D1Brush_iface);
-    ID2D1Brush_Release(&brush->ID2D1Brush_iface);
+    if (FAILED(hr = d2d_device_context_update_ps_cb(context, &brush, NULL, FALSE, FALSE)))
+    {
+        WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+        return;
+    }
+
+    d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, 6,
+            context->unit_vb, sizeof(D2D1_POINT_2F), &brush, NULL);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawBitmap(ID2D1DeviceContext6 *iface,
@@ -4380,6 +4396,13 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         { 1.0f,  1.0f},
         { 1.0f, -1.0f},
     };
+    static const D2D1_POINT_2F unit_quad[] =
+    {
+        {0.0f, 0.0f},
+        {0.0f, 1.0f},
+        {1.0f, 0.0f},
+        {1.0f, 1.0f},
+    };
     static const UINT16 indices[] = {0, 1, 2, 2, 1, 3};
     static const D3D_FEATURE_LEVEL feature_levels = D3D_FEATURE_LEVEL_10_0;
 
@@ -4519,6 +4542,16 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         goto err;
     }
 
+    buffer_desc.ByteWidth = sizeof(unit_quad);
+    buffer_data.pSysMem = unit_quad;
+
+    if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device,
+            &buffer_desc, &buffer_data, &render_target->unit_vb)))
+    {
+        WARN("Failed to create unit rectangle vertex buffer, hr %#lx.\n", hr);
+        goto err;
+    }
+
     rs_desc.FillMode = D3D11_FILL_SOLID;
     rs_desc.CullMode = D3D11_CULL_NONE;
     rs_desc.FrontCounterClockwise = FALSE;
@@ -4569,6 +4602,8 @@ err:
         IDWriteRenderingParams_Release(render_target->default_text_rendering_params);
     if (render_target->rs)
         ID3D11RasterizerState_Release(render_target->rs);
+    if (render_target->unit_vb)
+        ID3D11Buffer_Release(render_target->unit_vb);
     if (render_target->vb)
         ID3D11Buffer_Release(render_target->vb);
     if (render_target->ib)
