@@ -21,4 +21,49 @@
 
 #include <ddk/usb100.h>
 
+typedef enum _USB_DEVICE_TYPE
+{
+    Usb11Device = 0,
+    Usb20Device,
+} USB_DEVICE_TYPE;
+
+typedef enum _USB_DEVICE_SPEED
+{
+    UsbLowSpeed = 0,
+    UsbFullSpeed,
+    UsbHighSpeed,
+    UsbSuperSpeed,
+} USB_DEVICE_SPEED;
+
+#define USB_INTERFACE_ASSOCIATION_DESCRIPTOR_TYPE 0x0b
+
+#pragma pack(push,1)
+
+typedef struct _USB_INTERFACE_ASSOCIATION_DESCRIPTOR
+{
+    UCHAR bLength;
+    UCHAR bDescriptorType;
+    UCHAR bFirstInterface;
+    UCHAR bInterfaceCount;
+    UCHAR bFunctionClass;
+    UCHAR bFunctionSubClass;
+    UCHAR bFunctionProtocol;
+    UCHAR iFunction;
+} USB_INTERFACE_ASSOCIATION_DESCRIPTOR, *PUSB_INTERFACE_ASSOCIATION_DESCRIPTOR;
+
+typedef struct _USB_DEVICE_QUALIFIER_DESCRIPTOR
+{
+    UCHAR bLength;
+    UCHAR bDescriptorType;
+    USHORT bcdUSB;
+    UCHAR bDeviceClass;
+    UCHAR bDeviceSubClass;
+    UCHAR bDeviceProtocol;
+    UCHAR bMaxPacketSize0;
+    UCHAR bNumConfigurations;
+    UCHAR bReserved;
+} USB_DEVICE_QUALIFIER_DESCRIPTOR, *PUSB_DEVICE_QUALIFIER_DESCRIPTOR;
+
+#pragma pack(pop)
+
 #endif
