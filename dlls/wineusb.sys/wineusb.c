@@ -29,6 +29,7 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
+#include "initguid.h"
 #include "ddk/usb.h"
 #include "ddk/usbioctl.h"
 #include "wine/asm.h"
@@ -78,7 +79,44 @@ struct usb_object
 {
     enum device_kind kind;
     DEVICE_OBJECT *device_obj;
+    UNICODE_STRING link_name;
 };
+
+static const GUID *device_interface_guid(enum device_kind kind)
+{
+    switch (kind)
+    {
+        case DEVICE_KIND_CONTROLLER:
+            return &GUID_DEVINTERFACE_USB_HOST_CONTROLLER;
+        case DEVICE_KIND_HUB:
+            return &GUID_DEVINTERFACE_USB_HUB;
+        default:
+            return &GUID_DEVINTERFACE_USB_DEVICE;
+    }
+}
+
+static void register_device_interface(struct usb_object *obj)
+{
+    NTSTATUS status;
+
+    if ((status = IoRegisterDeviceInterface(obj->device_obj, device_interface_guid(obj->kind),
+            NULL, &obj->link_name)))
+    {
+        ERR("Failed to register interface, status %#lx.\n", status);
+        return;
+    }
+    IoSetDeviceInterfaceState(&obj->link_name, TRUE);
+}
+
+static void unregister_device_interface(struct usb_object *obj)
+{
+    if (obj->link_name.Buffer)
+    {
+        IoSetDeviceInterfaceState(&obj->link_name, FALSE);
+        RtlFreeUnicodeString(&obj->link_name);
+        obj->link_name.Buffer = NULL;
+    }
+}
 
 /* A fake host controller, one per Linux bus, child of the bus FDO. */
 struct usb_controller
@@ -747,6 +785,7 @@ static NTSTATUS controller_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         case IRP_MN_START_DEVICE:
+            register_device_interface(&controller->obj);
             IoInvalidateDeviceRelations(device_obj, BusRelations);
             ret = STATUS_SUCCESS;
             break;
@@ -763,16 +802,12 @@ static NTSTATUS controller_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             break;
 
         case IRP_MN_REMOVE_DEVICE:
+            unregister_device_interface(&controller->obj);
             if (controller->removed)
-            {
                 IoDeleteDevice(controller->obj.device_obj);
-                ret = STATUS_SUCCESS;
-            }
-            else
-            {
-                /* The controller is still linked; the bus FDO will delete it. */
-                ret = STATUS_SUCCESS;
-            }
+            /* Otherwise the controller is still linked; the bus FDO will
+             * delete it. */
+            ret = STATUS_SUCCESS;
             break;
 
         default:
@@ -846,6 +881,7 @@ static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         case IRP_MN_START_DEVICE:
+            register_device_interface(&hub->obj);
             EnterCriticalSection(&wineusb_cs);
             hub->started = TRUE;
             LeaveCriticalSection(&wineusb_cs);
@@ -865,6 +901,7 @@ static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             break;
 
         case IRP_MN_REMOVE_DEVICE:
+            unregister_device_interface(&hub->obj);
             if (hub->removed)
                 IoDeleteDevice(hub->obj.device_obj);
             ret = STATUS_SUCCESS;
@@ -920,6 +957,8 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         case IRP_MN_START_DEVICE:
+            if (!device->interface)
+                register_device_interface(&device->obj);
             ret = STATUS_SUCCESS;
             break;
 
@@ -939,6 +978,7 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             assert(device->removed);
             remove_pending_irps(device);
 
+            unregister_device_interface(&device->obj);
             destroy_unix_device(device->unix_device);
 
             if (device->descriptors)
