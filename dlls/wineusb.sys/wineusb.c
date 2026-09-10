@@ -1183,6 +1183,24 @@ static NTSTATUS WINAPI driver_internal_ioctl(DEVICE_OBJECT *device_obj, IRP *irp
     return status;
 }
 
+static NTSTATUS WINAPI driver_create(DEVICE_OBJECT *device, IRP *irp)
+{
+    TRACE("device %p, irp %p.\n", device, irp);
+
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS WINAPI driver_close(DEVICE_OBJECT *device, IRP *irp)
+{
+    TRACE("device %p, irp %p.\n", device, irp);
+
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS WINAPI driver_add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo)
 {
     NTSTATUS ret;
@@ -1225,6 +1243,8 @@ NTSTATUS WINAPI DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *path)
 
     driver->DriverExtension->AddDevice = driver_add_device;
     driver->DriverUnload = driver_unload;
+    driver->MajorFunction[IRP_MJ_CREATE] = driver_create;
+    driver->MajorFunction[IRP_MJ_CLOSE] = driver_close;
     driver->MajorFunction[IRP_MJ_PNP] = driver_pnp;
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = driver_internal_ioctl;
 
