@@ -948,6 +948,20 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             break;
 
         case IRP_MN_QUERY_DEVICE_TEXT:
+            if (stack->Parameters.QueryDeviceText.DeviceTextType == DeviceTextLocationInformation)
+            {
+                struct string_buffer buffer = {0};
+
+                append_id(&buffer, L"Port_#%04u.Hub_#%04u", device->devnum, device->busnum);
+                if (!buffer.string)
+                {
+                    ret = STATUS_NO_MEMORY;
+                    break;
+                }
+                irp->IoStatus.Information = (ULONG_PTR)buffer.string;
+                ret = STATUS_SUCCESS;
+                break;
+            }
             WARN("Unhandled IRP_MN_QUERY_DEVICE_TEXT text type %u.\n", stack->Parameters.QueryDeviceText.DeviceTextType);
             break;
 
