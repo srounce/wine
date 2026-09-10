@@ -2071,13 +2071,54 @@ CONFIGRET WINAPI CM_Get_DevNode_Property_Keys( DEVINST node, DEVPROPKEY *keys, U
     return CM_Get_DevNode_Property_Keys_Ex( node, keys, count, flags, NULL );
 }
 
+/* Return the children instance IDs of a device as a heap-allocated multi-sz
+ * list, from the Children property maintained by the PnP manager. */
+static CONFIGRET get_device_children( const struct device *dev, WCHAR **ret )
+{
+    struct property prop;
+    DEVPROPTYPE type;
+    DWORD size = 0;
+    WCHAR *buffer;
+
+    init_property( &prop, &DEVPKEY_Device_Children, &type, NULL, &size, TRUE );
+    if (get_device_property( HKEY_LOCAL_MACHINE, dev, &prop ) != ERROR_MORE_DATA || !size)
+        return CR_NO_SUCH_DEVNODE;
+
+    if (!(buffer = malloc( size + sizeof(WCHAR) ))) return CR_OUT_OF_MEMORY;
+    init_property( &prop, &DEVPKEY_Device_Children, &type, (BYTE *)buffer, &size, TRUE );
+    if (get_device_property( HKEY_LOCAL_MACHINE, dev, &prop )
+            || type != DEVPROP_TYPE_STRING_LIST || !buffer[0])
+    {
+        free( buffer );
+        return CR_NO_SUCH_DEVNODE;
+    }
+    buffer[size / sizeof(WCHAR)] = 0;
+
+    *ret = buffer;
+    return CR_SUCCESS;
+}
+
 /***********************************************************************
  *             CM_Get_Child_Ex  (cfgmgr32.@)
  */
 CONFIGRET WINAPI CM_Get_Child_Ex( DEVINST *child, DEVINST node, ULONG flags, HMACHINE machine )
 {
-    FIXME( "child %p, node %#lx, flags %#lx, machine %p stub!\n", child, node, flags, machine );
-    return CR_SUCCESS;
+    struct device dev;
+    WCHAR *children;
+    CONFIGRET ret;
+
+    TRACE( "child %p, node %#lx, flags %#lx, machine %p\n", child, node, flags, machine );
+    if (machine) FIXME( "machine %p not implemented!\n", machine );
+
+    if (!child) return CR_INVALID_POINTER;
+    *child = 0;
+
+    if (devnode_get_device( node, &dev )) return CR_INVALID_DEVNODE;
+
+    if ((ret = get_device_children( &dev, &children ))) return ret;
+    ret = CM_Locate_DevNodeW( child, children, 0 );
+    free( children );
+    return ret;
 }
 
 /***********************************************************************
@@ -2129,8 +2170,45 @@ CONFIGRET WINAPI CM_Get_DevNode_Status( ULONG *status, ULONG *problem, DEVINST n
  */
 CONFIGRET WINAPI CM_Get_Sibling_Ex( DEVINST *sibling, DEVINST node, ULONG flags, HMACHINE machine )
 {
-    FIXME( "sibling %p, node %#lx, flags %#lx, machine %p stub!\n", sibling, node, flags, machine );
-    return CR_FAILURE;
+    WCHAR parent_id[MAX_DEVICE_ID_LEN], device_id[MAX_DEVICE_ID_LEN], *children, *p;
+    struct device dev, parent;
+    struct property prop;
+    DEVPROPTYPE type;
+    DWORD size = sizeof(parent_id);
+    DEVINST parent_node;
+    CONFIGRET ret;
+
+    TRACE( "sibling %p, node %#lx, flags %#lx, machine %p\n", sibling, node, flags, machine );
+    if (machine) FIXME( "machine %p not implemented!\n", machine );
+
+    if (!sibling) return CR_INVALID_POINTER;
+    *sibling = 0;
+
+    if (devnode_get_device( node, &dev )) return CR_INVALID_DEVNODE;
+    swprintf( device_id, ARRAY_SIZE(device_id), L"%s\\%s\\%s", dev.enumerator, dev.device, dev.instance );
+
+    init_property( &prop, &DEVPKEY_Device_Parent, &type, (BYTE *)parent_id, &size, TRUE );
+    if (get_device_property( HKEY_LOCAL_MACHINE, &dev, &prop )) return CR_NO_SUCH_DEVNODE;
+    if (CM_Locate_DevNodeW( &parent_node, parent_id, 0 )) return CR_NO_SUCH_DEVNODE;
+    if (devnode_get_device( parent_node, &parent )) return CR_NO_SUCH_DEVNODE;
+
+    if ((ret = get_device_children( &parent, &children ))) return ret;
+
+    /* Siblings follow the parent's children order; return the entry after
+     * this device. */
+    ret = CR_NO_SUCH_DEVNODE;
+    for (p = children; *p; p += wcslen( p ) + 1)
+    {
+        if (!wcsicmp( p, device_id ))
+        {
+            p += wcslen( p ) + 1;
+            if (*p) ret = CM_Locate_DevNodeW( sibling, p, 0 );
+            break;
+        }
+    }
+
+    free( children );
+    return ret;
 }
 
 /***********************************************************************
