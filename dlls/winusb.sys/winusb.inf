@@ -1,0 +1,22 @@
+[Version]
+Signature="$CHICAGO$"
+ClassGuid={88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Class=USBDevice
+
+[Manufacturer]
+Wine=mfg_section
+
+[mfg_section]
+WinUSB device=device_section,USB\Class_ff
+
+[device_section.Services]
+AddService = WinUSB,0x2,svc_section
+
+[svc_section]
+Description="Wine WinUSB driver"
+DisplayName="WinUSB"
+ServiceBinary="%12%\winusb.sys"
+LoadOrderGroup="WinePlugPlay"
+ServiceType=1
+StartType=3
+ErrorControl=1

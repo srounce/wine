@@ -1595,6 +1595,7 @@ enable_wintab32
 enable_wintrust
 enable_wintypes
 enable_winusb
+enable_winusb_sys
 enable_wkscli
 enable_wlanapi
 enable_wlanui
@@ -22988,6 +22989,7 @@ wine_fn_config_makefile dlls/wintrust/tests enable_tests
 wine_fn_config_makefile dlls/wintypes enable_wintypes
 wine_fn_config_makefile dlls/wintypes/tests enable_tests
 wine_fn_config_makefile dlls/winusb enable_winusb
+wine_fn_config_makefile dlls/winusb.sys enable_winusb_sys
 wine_fn_config_makefile dlls/wkscli enable_wkscli
 wine_fn_config_makefile dlls/wlanapi enable_wlanapi
 wine_fn_config_makefile dlls/wlanapi/tests enable_tests
