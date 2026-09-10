@@ -2382,6 +2382,24 @@ static void test_pnp_devices(void)
         cm_ret = CM_Get_Device_IDA(cm_parent, parent_id, sizeof(parent_id), 0);
         ok(cm_ret == CR_SUCCESS, "CM_Get_Device_IDA: got %#lx\n", cm_ret);
         ok(!strcmp(parent_id, "ROOT\\WINETEST\\0"), "got parent ID %s\n", parent_id);
+
+        /* CM_Get_Child on the bus returns its only child; the child has no
+         * sibling. */
+        {
+            char child_id[MAX_DEVICE_ID_LEN];
+            DEVINST cm_child = 0, cm_sibling = 0xdeadbeef;
+
+            cm_ret = CM_Get_Child(&cm_child, cm_parent, 0);
+            ok(cm_ret == CR_SUCCESS, "CM_Get_Child: got %#lx\n", cm_ret);
+            ok(cm_child != 0, "got null child devnode\n");
+
+            cm_ret = CM_Get_Device_IDA(cm_child, child_id, sizeof(child_id), 0);
+            ok(cm_ret == CR_SUCCESS, "CM_Get_Device_IDA: got %#lx\n", cm_ret);
+            ok(!strcmp(child_id, "WINE\\TEST\\1"), "got child ID %s\n", child_id);
+
+            cm_ret = CM_Get_Sibling(&cm_sibling, cm_child, 0);
+            ok(cm_ret == CR_NO_SUCH_DEVNODE, "CM_Get_Sibling: got %#lx\n", cm_ret);
+        }
     }
 
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &child_class, 0, &iface);
