@@ -105,6 +105,27 @@ static bool get_event(struct usb_event *event)
     return true;
 }
 
+static enum usb_speed usb_speed_from_libusb(int speed)
+{
+    switch (speed)
+    {
+        case LIBUSB_SPEED_LOW:
+            return USB_SPEED_LOW;
+        case LIBUSB_SPEED_FULL:
+            return USB_SPEED_FULL;
+        case LIBUSB_SPEED_HIGH:
+            return USB_SPEED_HIGH;
+        case LIBUSB_SPEED_SUPER:
+            return USB_SPEED_SUPER;
+#if defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x01000107
+        case LIBUSB_SPEED_SUPER_PLUS:
+            return USB_SPEED_SUPER_PLUS;
+#endif
+        default:
+            return USB_SPEED_UNKNOWN;
+    }
+}
+
 static void add_usb_device(libusb_device *libusb_device)
 {
     struct libusb_config_descriptor *config_desc;
@@ -144,6 +165,12 @@ static void add_usb_device(libusb_device *libusb_device)
     usb_event.u.added_device.protocol = device_desc.bDeviceProtocol;
     usb_event.u.added_device.busnum = libusb_get_bus_number(libusb_device);
     usb_event.u.added_device.portnum = libusb_get_port_number(libusb_device);
+    usb_event.u.added_device.devnum = libusb_get_device_address(libusb_device);
+    usb_event.u.added_device.speed = usb_speed_from_libusb(libusb_get_device_speed(libusb_device));
+    if ((ret = libusb_get_port_numbers(libusb_device, usb_event.u.added_device.port_path,
+            sizeof(usb_event.u.added_device.port_path))) < 0)
+        ret = 0;
+    usb_event.u.added_device.port_path_len = ret;
     usb_event.u.added_device.interface = false;
     usb_event.u.added_device.interface_index = -1;
 

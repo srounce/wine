@@ -78,6 +78,9 @@ struct usb_device
     int16_t interface_index;
 
     uint8_t class, subclass, protocol, busnum, portnum;
+    uint8_t devnum, speed;
+    uint8_t port_path[USB_MAX_PORT_DEPTH];
+    uint8_t port_path_len;
 
     uint16_t vendor, product, revision, usbver;
 
@@ -134,6 +137,10 @@ static void add_unix_device(const struct usb_add_device_event *event)
     device->protocol = event->protocol;
     device->busnum = event->busnum;
     device->portnum = event->portnum;
+    device->devnum = event->devnum;
+    device->speed = event->speed;
+    memcpy(device->port_path, event->port_path, sizeof(device->port_path));
+    device->port_path_len = event->port_path_len;
 
     device->vendor = event->vendor;
     device->product = event->product;

@@ -33,6 +33,20 @@ enum usb_event_type
     USB_EVENT_TRANSFER_COMPLETE,
 };
 
+enum usb_speed
+{
+    USB_SPEED_UNKNOWN,
+    USB_SPEED_LOW,
+    USB_SPEED_FULL,
+    USB_SPEED_HIGH,
+    USB_SPEED_SUPER,
+    USB_SPEED_SUPER_PLUS,
+};
+
+/* Maximum depth of the port path to a device, per the USB spec (5 tiers of
+ * external hub plus the root port, with one spare). */
+#define USB_MAX_PORT_DEPTH 7
+
 struct usb_event
 {
     enum usb_event_type type;
@@ -44,6 +58,10 @@ struct usb_event
             struct unix_device *device;
             UINT16 vendor, product, revision, usbver;
             UINT8 class, subclass, protocol, busnum, portnum;
+            UINT8 devnum;
+            UINT8 speed;
+            UINT8 port_path[USB_MAX_PORT_DEPTH];
+            UINT8 port_path_len;
             bool interface;
             INT16 interface_index;
         } added_device;
