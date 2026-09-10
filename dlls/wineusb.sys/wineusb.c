@@ -65,11 +65,11 @@ __ASM_STDCALL_FUNC( wrap_fastcall_func1, 8,
 
 DECLARE_CRITICAL_SECTION(wineusb_cs);
 
-static struct list device_list = LIST_INIT(device_list);
-
 enum device_kind
 {
     DEVICE_KIND_FDO,
+    DEVICE_KIND_CONTROLLER,
+    DEVICE_KIND_HUB,
     DEVICE_KIND_DEVICE,
 };
 
@@ -80,12 +80,47 @@ struct usb_object
     DEVICE_OBJECT *device_obj;
 };
 
+/* A fake host controller, one per Linux bus, child of the bus FDO. */
+struct usb_controller
+{
+    struct usb_object obj;
+
+    struct list entry;
+    BOOL removed;
+
+    uint8_t busnum;
+    struct usb_hub *hub;
+};
+
+/* A fake root hub; every device on the bus is exposed as one of its
+ * children, connected at the port matching its bus address, regardless of
+ * the physical hub topology. */
+struct usb_hub
+{
+    struct usb_object obj;
+
+    BOOL removed;
+    /* Whether the hub PDO has been started. Children are only reported once
+     * the hub itself is enumerated; before that, invalidating its relations
+     * could enumerate children with a parent the PnP manager does not know
+     * about yet. */
+    BOOL started;
+
+    uint8_t busnum;
+    struct usb_controller *controller;
+    struct list children;
+};
+
+static struct list controller_list = LIST_INIT(controller_list);
+
 struct usb_device
 {
     struct usb_object obj;
 
     struct list entry;
     BOOL removed;
+
+    struct usb_hub *hub;
 
     bool interface;
     int16_t interface_index;
@@ -120,26 +155,84 @@ static void destroy_unix_device(struct unix_device *unix_device)
     WINE_UNIX_CALL(unix_usb_destroy_device, &params);
 }
 
-static void add_unix_device(const struct usb_add_device_event *event)
+static DEVICE_OBJECT *create_pdo(ULONG extension_size)
 {
     static unsigned int name_index;
-    struct usb_device *device;
     DEVICE_OBJECT *device_obj;
     UNICODE_STRING string;
     NTSTATUS status;
     WCHAR name[26];
 
-    TRACE("Adding new device %p, vendor %04x, product %04x.\n", event->device,
-            event->vendor, event->product);
-
     swprintf(name, ARRAY_SIZE(name), L"\\Device\\USBPDO-%u", name_index++);
     RtlInitUnicodeString(&string, name);
-    if ((status = IoCreateDevice(driver_obj, sizeof(*device), &string,
+    if ((status = IoCreateDevice(driver_obj, extension_size, &string,
             FILE_DEVICE_USB, 0, FALSE, &device_obj)))
     {
         ERR("Failed to create device, status %#lx.\n", status);
-        return;
+        return NULL;
     }
+    return device_obj;
+}
+
+/* Called from the event thread only. */
+static struct usb_controller *get_usb_controller(uint8_t busnum)
+{
+    DEVICE_OBJECT *controller_obj, *hub_obj;
+    struct usb_controller *controller;
+    struct usb_hub *hub;
+
+    LIST_FOR_EACH_ENTRY(controller, &controller_list, struct usb_controller, entry)
+    {
+        if (controller->busnum == busnum && !controller->removed)
+            return controller;
+    }
+
+    if (!(controller_obj = create_pdo(sizeof(*controller))))
+        return NULL;
+    if (!(hub_obj = create_pdo(sizeof(*hub))))
+    {
+        IoDeleteDevice(controller_obj);
+        return NULL;
+    }
+
+    controller = controller_obj->DeviceExtension;
+    controller->obj.kind = DEVICE_KIND_CONTROLLER;
+    controller->obj.device_obj = controller_obj;
+    controller->busnum = busnum;
+
+    hub = hub_obj->DeviceExtension;
+    hub->obj.kind = DEVICE_KIND_HUB;
+    hub->obj.device_obj = hub_obj;
+    hub->busnum = busnum;
+    hub->controller = controller;
+    list_init(&hub->children);
+    controller->hub = hub;
+
+    EnterCriticalSection(&wineusb_cs);
+    list_add_tail(&controller_list, &controller->entry);
+    LeaveCriticalSection(&wineusb_cs);
+
+    /* The controller and hub report their own children once started, so a
+     * single invalidation enumerates the whole chain in order. */
+    IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+    return controller;
+}
+
+static void add_unix_device(const struct usb_add_device_event *event)
+{
+    struct usb_controller *controller;
+    struct usb_device *device;
+    DEVICE_OBJECT *device_obj;
+    BOOL started;
+
+    TRACE("Adding new device %p, vendor %04x, product %04x.\n", event->device,
+            event->vendor, event->product);
+
+    if (!(controller = get_usb_controller(event->busnum)))
+        return;
+
+    if (!(device_obj = create_pdo(sizeof(*device))))
+        return;
 
     device = device_obj->DeviceExtension;
     device->obj.kind = DEVICE_KIND_DEVICE;
@@ -147,6 +240,7 @@ static void add_unix_device(const struct usb_add_device_event *event)
     device->unix_device = event->device;
     InitializeListHead(&device->irp_list);
     device->removed = FALSE;
+    device->hub = controller->hub;
 
     device->interface = event->interface;
     device->interface_index = event->interface_index;
@@ -192,34 +286,48 @@ static void add_unix_device(const struct usb_add_device_event *event)
     }
 
     EnterCriticalSection(&wineusb_cs);
-    list_add_tail(&device_list, &device->entry);
+    list_add_tail(&controller->hub->children, &device->entry);
+    /* If the hub is not started yet, it reports its children when it is. */
+    started = controller->hub->started;
     LeaveCriticalSection(&wineusb_cs);
 
-    IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+    if (started)
+        IoInvalidateDeviceRelations(controller->hub->obj.device_obj, BusRelations);
 }
 
 static void remove_unix_device(struct unix_device *unix_device)
 {
+    struct usb_controller *controller;
+    struct usb_hub *hub = NULL;
     struct usb_device *device;
 
     TRACE("Removing device %p.\n", unix_device);
 
     EnterCriticalSection(&wineusb_cs);
-    LIST_FOR_EACH_ENTRY(device, &device_list, struct usb_device, entry)
+    LIST_FOR_EACH_ENTRY(controller, &controller_list, struct usb_controller, entry)
     {
-        if (device->unix_device == unix_device)
+        if (!controller->hub)
+            continue;
+        LIST_FOR_EACH_ENTRY(device, &controller->hub->children, struct usb_device, entry)
         {
-            if (!device->removed)
+            if (device->unix_device == unix_device)
             {
-                device->removed = TRUE;
-                list_remove(&device->entry);
+                hub = controller->hub;
+                if (!device->removed)
+                {
+                    device->removed = TRUE;
+                    list_remove(&device->entry);
+                }
+                break;
             }
-            break;
         }
+        if (hub)
+            break;
     }
     LeaveCriticalSection(&wineusb_cs);
 
-    IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+    if (hub)
+        IoInvalidateDeviceRelations(hub->obj.device_obj, BusRelations);
 }
 
 static HANDLE event_thread;
@@ -280,7 +388,7 @@ static NTSTATUS fdo_pnp(IRP *irp)
     {
         case IRP_MN_QUERY_DEVICE_RELATIONS:
         {
-            struct usb_device *device;
+            struct usb_controller *controller;
             DEVICE_RELATIONS *devices;
             unsigned int i = 0;
 
@@ -293,17 +401,17 @@ static NTSTATUS fdo_pnp(IRP *irp)
             EnterCriticalSection(&wineusb_cs);
 
             if (!(devices = ExAllocatePool(PagedPool,
-                    offsetof(DEVICE_RELATIONS, Objects[list_count(&device_list)]))))
+                    offsetof(DEVICE_RELATIONS, Objects[list_count(&controller_list)]))))
             {
                 LeaveCriticalSection(&wineusb_cs);
                 irp->IoStatus.Status = STATUS_NO_MEMORY;
                 break;
             }
 
-            LIST_FOR_EACH_ENTRY(device, &device_list, struct usb_device, entry)
+            LIST_FOR_EACH_ENTRY(controller, &controller_list, struct usb_controller, entry)
             {
-                devices->Objects[i++] = device->obj.device_obj;
-                call_fastcall_func1(ObfReferenceObject, device->obj.device_obj);
+                devices->Objects[i++] = controller->obj.device_obj;
+                call_fastcall_func1(ObfReferenceObject, controller->obj.device_obj);
             }
 
             LeaveCriticalSection(&wineusb_cs);
@@ -326,7 +434,8 @@ static NTSTATUS fdo_pnp(IRP *irp)
 
         case IRP_MN_REMOVE_DEVICE:
         {
-            struct usb_device *device, *cursor;
+            struct usb_controller *controller, *cursor;
+            struct usb_device *device, *cursor2;
 
             WINE_UNIX_CALL(unix_usb_exit, NULL);
             WaitForSingleObject(event_thread, INFINITE);
@@ -348,14 +457,23 @@ static NTSTATUS fdo_pnp(IRP *irp)
              *
              * FIXME: This is still broken, though. If a device is hotplugged
              * and then removed, it'll be unlinked and never freed. */
-            LIST_FOR_EACH_ENTRY_SAFE(device, cursor, &device_list, struct usb_device, entry)
+            LIST_FOR_EACH_ENTRY_SAFE(controller, cursor, &controller_list, struct usb_controller, entry)
             {
-                assert(!device->removed);
-                destroy_unix_device(device->unix_device);
-                list_remove(&device->entry);
-                if (device->descriptors)
-                    ExFreePool(device->descriptors);
-                IoDeleteDevice(device->obj.device_obj);
+                if (controller->hub)
+                {
+                    LIST_FOR_EACH_ENTRY_SAFE(device, cursor2, &controller->hub->children, struct usb_device, entry)
+                    {
+                        assert(!device->removed);
+                        destroy_unix_device(device->unix_device);
+                        list_remove(&device->entry);
+                        if (device->descriptors)
+                            ExFreePool(device->descriptors);
+                        IoDeleteDevice(device->obj.device_obj);
+                    }
+                    IoDeleteDevice(controller->hub->obj.device_obj);
+                }
+                list_remove(&controller->entry);
+                IoDeleteDevice(controller->obj.device_obj);
             }
             LeaveCriticalSection(&wineusb_cs);
 
@@ -494,6 +612,273 @@ static NTSTATUS query_id(struct usb_device *device, IRP *irp, BUS_QUERY_ID_TYPE 
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS controller_query_id(struct usb_controller *controller, IRP *irp, BUS_QUERY_ID_TYPE type)
+{
+    struct string_buffer buffer = {0};
+
+    TRACE("type %#x.\n", type);
+
+    switch (type)
+    {
+        case BusQueryDeviceID:
+            append_id(&buffer, L"PCI\\VEN_1D6B&DEV_0003");
+            break;
+
+        case BusQueryInstanceID:
+            append_id(&buffer, L"%u", controller->busnum);
+            break;
+
+        case BusQueryHardwareIDs:
+            append_id(&buffer, L"PCI\\VEN_1D6B&DEV_0003");
+            append_id(&buffer, L"");
+            break;
+
+        case BusQueryCompatibleIDs:
+            append_id(&buffer, L"");
+            break;
+
+        default:
+            FIXME("Unhandled ID query type %#x.\n", type);
+            return irp->IoStatus.Status;
+    }
+
+    if (!buffer.string)
+        return STATUS_NO_MEMORY;
+
+    irp->IoStatus.Information = (ULONG_PTR)buffer.string;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS hub_query_id(struct usb_hub *hub, IRP *irp, BUS_QUERY_ID_TYPE type)
+{
+    struct string_buffer buffer = {0};
+
+    TRACE("type %#x.\n", type);
+
+    switch (type)
+    {
+        case BusQueryDeviceID:
+            append_id(&buffer, L"USB\\ROOT_HUB30");
+            break;
+
+        case BusQueryInstanceID:
+            append_id(&buffer, L"%u", hub->busnum);
+            break;
+
+        case BusQueryHardwareIDs:
+            append_id(&buffer, L"USB\\ROOT_HUB30&VID1D6B&PID0003");
+            append_id(&buffer, L"USB\\ROOT_HUB30");
+            append_id(&buffer, L"");
+            break;
+
+        case BusQueryCompatibleIDs:
+            append_id(&buffer, L"");
+            break;
+
+        default:
+            FIXME("Unhandled ID query type %#x.\n", type);
+            return irp->IoStatus.Status;
+    }
+
+    if (!buffer.string)
+        return STATUS_NO_MEMORY;
+
+    irp->IoStatus.Information = (ULONG_PTR)buffer.string;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS controller_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    struct usb_controller *controller = device_obj->DeviceExtension;
+    NTSTATUS ret = irp->IoStatus.Status;
+
+    TRACE("device_obj %p, irp %p, minor function %#x.\n", device_obj, irp, stack->MinorFunction);
+
+    switch (stack->MinorFunction)
+    {
+        case IRP_MN_QUERY_ID:
+            ret = controller_query_id(controller, irp, stack->Parameters.QueryId.IdType);
+            break;
+
+        case IRP_MN_QUERY_CAPABILITIES:
+        {
+            DEVICE_CAPABILITIES *caps = stack->Parameters.DeviceCapabilities.Capabilities;
+
+            caps->RawDeviceOK = 1;
+            caps->UniqueID = 1;
+
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        case IRP_MN_QUERY_DEVICE_RELATIONS:
+        {
+            DEVICE_RELATIONS *devices;
+            unsigned int i = 0;
+
+            if (stack->Parameters.QueryDeviceRelations.Type != BusRelations)
+            {
+                FIXME("Unhandled device relations type %#x.\n", stack->Parameters.QueryDeviceRelations.Type);
+                break;
+            }
+
+            EnterCriticalSection(&wineusb_cs);
+
+            if (!(devices = ExAllocatePool(PagedPool, offsetof(DEVICE_RELATIONS, Objects[1]))))
+            {
+                LeaveCriticalSection(&wineusb_cs);
+                ret = STATUS_NO_MEMORY;
+                break;
+            }
+
+            if (controller->hub && !controller->hub->removed)
+            {
+                devices->Objects[i++] = controller->hub->obj.device_obj;
+                call_fastcall_func1(ObfReferenceObject, controller->hub->obj.device_obj);
+            }
+
+            LeaveCriticalSection(&wineusb_cs);
+
+            devices->Count = i;
+            irp->IoStatus.Information = (ULONG_PTR)devices;
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        case IRP_MN_START_DEVICE:
+            IoInvalidateDeviceRelations(device_obj, BusRelations);
+            ret = STATUS_SUCCESS;
+            break;
+
+        case IRP_MN_SURPRISE_REMOVAL:
+            EnterCriticalSection(&wineusb_cs);
+            if (!controller->removed)
+            {
+                controller->removed = TRUE;
+                list_remove(&controller->entry);
+            }
+            LeaveCriticalSection(&wineusb_cs);
+            ret = STATUS_SUCCESS;
+            break;
+
+        case IRP_MN_REMOVE_DEVICE:
+            if (controller->removed)
+            {
+                IoDeleteDevice(controller->obj.device_obj);
+                ret = STATUS_SUCCESS;
+            }
+            else
+            {
+                /* The controller is still linked; the bus FDO will delete it. */
+                ret = STATUS_SUCCESS;
+            }
+            break;
+
+        default:
+            FIXME("Unhandled minor function %#x.\n", stack->MinorFunction);
+    }
+
+    irp->IoStatus.Status = ret;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return ret;
+}
+
+static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    struct usb_hub *hub = device_obj->DeviceExtension;
+    NTSTATUS ret = irp->IoStatus.Status;
+
+    TRACE("device_obj %p, irp %p, minor function %#x.\n", device_obj, irp, stack->MinorFunction);
+
+    switch (stack->MinorFunction)
+    {
+        case IRP_MN_QUERY_ID:
+            ret = hub_query_id(hub, irp, stack->Parameters.QueryId.IdType);
+            break;
+
+        case IRP_MN_QUERY_CAPABILITIES:
+        {
+            DEVICE_CAPABILITIES *caps = stack->Parameters.DeviceCapabilities.Capabilities;
+
+            caps->RawDeviceOK = 1;
+            caps->UniqueID = 1;
+
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        case IRP_MN_QUERY_DEVICE_RELATIONS:
+        {
+            struct usb_device *device;
+            DEVICE_RELATIONS *devices;
+            unsigned int i = 0;
+
+            if (stack->Parameters.QueryDeviceRelations.Type != BusRelations)
+            {
+                FIXME("Unhandled device relations type %#x.\n", stack->Parameters.QueryDeviceRelations.Type);
+                break;
+            }
+
+            EnterCriticalSection(&wineusb_cs);
+
+            if (!(devices = ExAllocatePool(PagedPool,
+                    offsetof(DEVICE_RELATIONS, Objects[list_count(&hub->children)]))))
+            {
+                LeaveCriticalSection(&wineusb_cs);
+                ret = STATUS_NO_MEMORY;
+                break;
+            }
+
+            LIST_FOR_EACH_ENTRY(device, &hub->children, struct usb_device, entry)
+            {
+                devices->Objects[i++] = device->obj.device_obj;
+                call_fastcall_func1(ObfReferenceObject, device->obj.device_obj);
+            }
+
+            LeaveCriticalSection(&wineusb_cs);
+
+            devices->Count = i;
+            irp->IoStatus.Information = (ULONG_PTR)devices;
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        case IRP_MN_START_DEVICE:
+            EnterCriticalSection(&wineusb_cs);
+            hub->started = TRUE;
+            LeaveCriticalSection(&wineusb_cs);
+            IoInvalidateDeviceRelations(device_obj, BusRelations);
+            ret = STATUS_SUCCESS;
+            break;
+
+        case IRP_MN_SURPRISE_REMOVAL:
+            EnterCriticalSection(&wineusb_cs);
+            if (!hub->removed)
+            {
+                hub->removed = TRUE;
+                hub->controller->hub = NULL;
+            }
+            LeaveCriticalSection(&wineusb_cs);
+            ret = STATUS_SUCCESS;
+            break;
+
+        case IRP_MN_REMOVE_DEVICE:
+            if (hub->removed)
+                IoDeleteDevice(hub->obj.device_obj);
+            ret = STATUS_SUCCESS;
+            break;
+
+        default:
+            FIXME("Unhandled minor function %#x.\n", stack->MinorFunction);
+    }
+
+    irp->IoStatus.Status = ret;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return ret;
+}
+
 static void remove_pending_irps(struct usb_device *device)
 {
     LIST_ENTRY *entry;
@@ -527,6 +912,8 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             DEVICE_CAPABILITIES *caps = stack->Parameters.DeviceCapabilities.Capabilities;
 
             caps->RawDeviceOK = 1;
+            caps->Removable = 1;
+            caps->Address = device->devnum;
 
             ret = STATUS_SUCCESS;
             break;
@@ -577,9 +964,17 @@ static NTSTATUS WINAPI driver_pnp(DEVICE_OBJECT *device, IRP *irp)
 {
     struct usb_object *obj = device->DeviceExtension;
 
-    if (obj->kind == DEVICE_KIND_FDO)
-        return fdo_pnp(irp);
-    return pdo_pnp(device, irp);
+    switch (obj->kind)
+    {
+        case DEVICE_KIND_FDO:
+            return fdo_pnp(irp);
+        case DEVICE_KIND_CONTROLLER:
+            return controller_pnp(device, irp);
+        case DEVICE_KIND_HUB:
+            return hub_pnp(device, irp);
+        default:
+            return pdo_pnp(device, irp);
+    }
 }
 
 static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
@@ -696,6 +1091,13 @@ static NTSTATUS WINAPI driver_internal_ioctl(DEVICE_OBJECT *device_obj, IRP *irp
     BOOL removed;
 
     TRACE("device_obj %p, irp %p, code %#lx.\n", device_obj, irp, code);
+
+    if (device->obj.kind != DEVICE_KIND_DEVICE)
+    {
+        irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return STATUS_NOT_SUPPORTED;
+    }
 
     EnterCriticalSection(&wineusb_cs);
     removed = device->removed;
