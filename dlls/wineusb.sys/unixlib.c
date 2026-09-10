@@ -139,6 +139,14 @@ static void add_usb_device(libusb_device *libusb_device)
 
     libusb_get_device_descriptor(libusb_device, &device_desc);
 
+    /* Hubs are exposed to Windows through the emulated topology instead, and
+     * the kernel does not allow I/O to them through usbfs anyway. */
+    if (device_desc.bDeviceClass == LIBUSB_CLASS_HUB)
+    {
+        TRACE("Ignoring hub device %p.\n", libusb_device);
+        return;
+    }
+
     TRACE("Adding new device %p, vendor %04x, product %04x.\n", libusb_device,
             device_desc.idVendor, device_desc.idProduct);
 
