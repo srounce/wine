@@ -498,49 +498,6 @@ static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
             break;
         }
 
-        case IOCTL_WINE_WINUSB_READ_PIPE:
-        case IOCTL_WINE_WINUSB_WRITE_PIPE:
-        {
-            const struct wine_winusb_pipe_params *params = (void *)buffer;
-            USBD_PIPE_HANDLE pipe;
-            URB *urb;
-
-            if (inlen < sizeof(*params))
-            {
-                status = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-            if (!(pipe = get_pipe_handle(device, params->pipe)))
-            {
-                status = STATUS_INVALID_PARAMETER;
-                break;
-            }
-
-            if (!(urb = ExAllocatePool(NonPagedPool, sizeof(*urb))))
-            {
-                status = STATUS_NO_MEMORY;
-                break;
-            }
-            memset(urb, 0, sizeof(*urb));
-            urb->UrbHeader.Length = sizeof(urb->UrbBulkOrInterruptTransfer);
-            urb->UrbHeader.Function = URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
-            urb->UrbBulkOrInterruptTransfer.PipeHandle = pipe;
-            if (code == IOCTL_WINE_WINUSB_READ_PIPE)
-            {
-                urb->UrbBulkOrInterruptTransfer.TransferFlags = USBD_TRANSFER_DIRECTION_IN;
-                urb->UrbBulkOrInterruptTransfer.TransferBuffer = buffer;
-                urb->UrbBulkOrInterruptTransfer.TransferBufferLength = outlen;
-            }
-            else
-            {
-                urb->UrbBulkOrInterruptTransfer.TransferBuffer = buffer + sizeof(*params);
-                urb->UrbBulkOrInterruptTransfer.TransferBufferLength = inlen - sizeof(*params);
-            }
-
-            status = submit_urb_async(device, irp, urb);
-            break;
-        }
-
         case IOCTL_WINE_WINUSB_RESET_PIPE:
         case IOCTL_WINE_WINUSB_ABORT_PIPE:
         {
@@ -592,8 +549,42 @@ static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         default:
+        {
+            ULONG function = (code >> 2) & 0xfff;
+
+            if ((function & ~0xffu) == WINE_WINUSB_TRANSFER_FUNCTION_BASE)
+            {
+                UCHAR address = function & 0xff;
+                BOOL in = address & 0x80;
+                USBD_PIPE_HANDLE pipe;
+                URB *urb;
+
+                if (!(pipe = get_pipe_handle(device, address)))
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+
+                if (!(urb = ExAllocatePool(NonPagedPool, sizeof(*urb))))
+                {
+                    status = STATUS_NO_MEMORY;
+                    break;
+                }
+                memset(urb, 0, sizeof(*urb));
+                urb->UrbHeader.Length = sizeof(urb->UrbBulkOrInterruptTransfer);
+                urb->UrbHeader.Function = URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
+                urb->UrbBulkOrInterruptTransfer.PipeHandle = pipe;
+                urb->UrbBulkOrInterruptTransfer.TransferFlags = in ? USBD_TRANSFER_DIRECTION_IN : 0;
+                urb->UrbBulkOrInterruptTransfer.TransferBuffer = buffer;
+                urb->UrbBulkOrInterruptTransfer.TransferBufferLength = in ? outlen : inlen;
+
+                status = submit_urb_async(device, irp, urb);
+                break;
+            }
+
             FIXME("Unhandled ioctl %#lx (device %#lx, access %#lx, function %#lx, method %#lx).\n",
                     code, code >> 16, (code >> 14) & 3, (code >> 2) & 0xfff, code & 3);
+        }
     }
 
     if (status != STATUS_PENDING)
