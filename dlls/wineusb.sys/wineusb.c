@@ -84,6 +84,11 @@ struct usb_device
 
     uint16_t vendor, product, revision, usbver;
 
+    /* Cached device descriptor followed by the raw descriptor set of every
+     * configuration; only present for whole-device PDOs. */
+    void *descriptors;
+    uint32_t descriptors_len;
+
     struct unix_device *unix_device;
 
     LIST_ENTRY irp_list;
@@ -146,6 +151,31 @@ static void add_unix_device(const struct usb_add_device_event *event)
     device->product = event->product;
     device->revision = event->revision;
     device->usbver = event->usbver;
+
+    if (!device->interface)
+    {
+        struct usb_get_descriptors_params params = {.device = device->unix_device};
+        UINT32 needed = 0;
+
+        params.needed = &needed;
+        if (WINE_UNIX_CALL(unix_usb_get_descriptors, &params) == STATUS_BUFFER_TOO_SMALL
+                && (device->descriptors = ExAllocatePool(NonPagedPool, needed)))
+        {
+            params.buffer = device->descriptors;
+            params.size = needed;
+            if (WINE_UNIX_CALL(unix_usb_get_descriptors, &params))
+            {
+                ExFreePool(device->descriptors);
+                device->descriptors = NULL;
+            }
+            else
+            {
+                device->descriptors_len = needed;
+            }
+        }
+        if (!device->descriptors)
+            WARN("Failed to cache descriptors for device %p.\n", event->device);
+    }
 
     EnterCriticalSection(&wineusb_cs);
     list_add_tail(&device_list, &device->entry);
@@ -309,6 +339,8 @@ static NTSTATUS fdo_pnp(IRP *irp)
                 assert(!device->removed);
                 destroy_unix_device(device->unix_device);
                 list_remove(&device->entry);
+                if (device->descriptors)
+                    ExFreePool(device->descriptors);
                 IoDeleteDevice(device->device_obj);
             }
             LeaveCriticalSection(&wineusb_cs);
@@ -508,6 +540,8 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
             destroy_unix_device(device->unix_device);
 
+            if (device->descriptors)
+                ExFreePool(device->descriptors);
             IoDeleteDevice(device->device_obj);
             ret = STATUS_SUCCESS;
             break;

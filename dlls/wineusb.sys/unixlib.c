@@ -46,6 +46,9 @@ struct unix_device
     libusb_device_handle *handle;
     struct unix_device *parent;
     unsigned int refcount;
+
+    void *descriptors;
+    uint32_t descriptors_len;
 };
 
 static libusb_hotplug_callback_handle hotplug_cb_handle;
@@ -656,6 +659,7 @@ static void decref_device(struct unix_device *device)
         decref_device(device->parent);
     else
         libusb_close(device->handle);
+    free(device->descriptors);
     free(device);
 }
 
@@ -669,6 +673,163 @@ static NTSTATUS usb_destroy_device(void *args)
     return STATUS_SUCCESS;
 }
 
+struct desc_buffer
+{
+    uint8_t *data;
+    size_t len, capacity;
+};
+
+static bool append_bytes(struct desc_buffer *buf, const void *data, size_t len)
+{
+    if (!array_reserve((void **)&buf->data, &buf->capacity, buf->len + len, 1))
+        return false;
+    memcpy(buf->data + buf->len, data, len);
+    buf->len += len;
+    return true;
+}
+
+/* libusb only exposes parsed descriptors, so the raw descriptor set is
+ * reassembled in wire format. Unrecognized descriptors are preserved through
+ * the "extra" blocks, which keep their position relative to the standard
+ * descriptor preceding them. */
+static bool append_config_descriptor(struct desc_buffer *buf, const struct libusb_config_descriptor *config)
+{
+    size_t start = buf->len, total;
+    uint8_t desc[9], i, e;
+    int a;
+
+    desc[0] = config->bLength;
+    desc[1] = LIBUSB_DT_CONFIG;
+    desc[2] = 0; /* wTotalLength, patched below */
+    desc[3] = 0;
+    desc[4] = config->bNumInterfaces;
+    desc[5] = config->bConfigurationValue;
+    desc[6] = config->iConfiguration;
+    desc[7] = config->bmAttributes;
+    desc[8] = config->MaxPower;
+    if (!append_bytes(buf, desc, 9))
+        return false;
+    if (!append_bytes(buf, config->extra, config->extra_length))
+        return false;
+
+    for (i = 0; i < config->bNumInterfaces; ++i)
+    {
+        const struct libusb_interface *interface = &config->interface[i];
+
+        for (a = 0; a < interface->num_altsetting; ++a)
+        {
+            const struct libusb_interface_descriptor *iface_desc = &interface->altsetting[a];
+
+            desc[0] = iface_desc->bLength;
+            desc[1] = LIBUSB_DT_INTERFACE;
+            desc[2] = iface_desc->bInterfaceNumber;
+            desc[3] = iface_desc->bAlternateSetting;
+            desc[4] = iface_desc->bNumEndpoints;
+            desc[5] = iface_desc->bInterfaceClass;
+            desc[6] = iface_desc->bInterfaceSubClass;
+            desc[7] = iface_desc->bInterfaceProtocol;
+            desc[8] = iface_desc->iInterface;
+            if (!append_bytes(buf, desc, 9))
+                return false;
+            if (!append_bytes(buf, iface_desc->extra, iface_desc->extra_length))
+                return false;
+
+            for (e = 0; e < iface_desc->bNumEndpoints; ++e)
+            {
+                const struct libusb_endpoint_descriptor *endpoint = &iface_desc->endpoint[e];
+                /* Audio endpoint descriptors have two extra bytes. */
+                uint8_t len = endpoint->bLength >= 9 ? 9 : 7;
+
+                desc[0] = endpoint->bLength;
+                desc[1] = LIBUSB_DT_ENDPOINT;
+                desc[2] = endpoint->bEndpointAddress;
+                desc[3] = endpoint->bmAttributes;
+                desc[4] = endpoint->wMaxPacketSize;
+                desc[5] = endpoint->wMaxPacketSize >> 8;
+                desc[6] = endpoint->bInterval;
+                desc[7] = endpoint->bRefresh;
+                desc[8] = endpoint->bSynchAddress;
+                if (!append_bytes(buf, desc, len))
+                    return false;
+                if (!append_bytes(buf, endpoint->extra, endpoint->extra_length))
+                    return false;
+            }
+        }
+    }
+
+    total = buf->len - start;
+    buf->data[start + 2] = total;
+    buf->data[start + 3] = total >> 8;
+    return true;
+}
+
+static NTSTATUS usb_get_descriptors(void *args)
+{
+    const struct usb_get_descriptors_params *params = args;
+    struct unix_device *device = params->device;
+
+    if (!device->descriptors)
+    {
+        libusb_device *libusb_device = libusb_get_device(device->handle);
+        struct libusb_device_descriptor device_desc;
+        struct desc_buffer buf = {0};
+        uint8_t desc[18], i;
+        int ret;
+
+        libusb_get_device_descriptor(libusb_device, &device_desc);
+
+        desc[0] = device_desc.bLength;
+        desc[1] = LIBUSB_DT_DEVICE;
+        desc[2] = device_desc.bcdUSB;
+        desc[3] = device_desc.bcdUSB >> 8;
+        desc[4] = device_desc.bDeviceClass;
+        desc[5] = device_desc.bDeviceSubClass;
+        desc[6] = device_desc.bDeviceProtocol;
+        desc[7] = device_desc.bMaxPacketSize0;
+        desc[8] = device_desc.idVendor;
+        desc[9] = device_desc.idVendor >> 8;
+        desc[10] = device_desc.idProduct;
+        desc[11] = device_desc.idProduct >> 8;
+        desc[12] = device_desc.bcdDevice;
+        desc[13] = device_desc.bcdDevice >> 8;
+        desc[14] = device_desc.iManufacturer;
+        desc[15] = device_desc.iProduct;
+        desc[16] = device_desc.iSerialNumber;
+        desc[17] = device_desc.bNumConfigurations;
+        if (!append_bytes(&buf, desc, sizeof(desc)))
+            return STATUS_NO_MEMORY;
+
+        for (i = 0; i < device_desc.bNumConfigurations; ++i)
+        {
+            struct libusb_config_descriptor *config;
+
+            if ((ret = libusb_get_config_descriptor(libusb_device, i, &config)))
+            {
+                WARN("Failed to get configuration descriptor %u: %s\n", i, libusb_strerror(ret));
+                free(buf.data);
+                return STATUS_UNSUCCESSFUL;
+            }
+            ret = !append_config_descriptor(&buf, config);
+            libusb_free_config_descriptor(config);
+            if (ret)
+            {
+                free(buf.data);
+                return STATUS_NO_MEMORY;
+            }
+        }
+
+        device->descriptors = buf.data;
+        device->descriptors_len = buf.len;
+    }
+
+    *params->needed = device->descriptors_len;
+    if (!params->buffer || params->size < device->descriptors_len)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    memcpy(params->buffer, device->descriptors, device->descriptors_len);
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
 #define X(name) [unix_ ## name] = name
@@ -678,4 +839,5 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     X(usb_submit_urb),
     X(usb_cancel_transfer),
     X(usb_destroy_device),
+    X(usb_get_descriptors),
 };
