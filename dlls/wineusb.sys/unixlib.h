@@ -92,6 +92,17 @@ struct usb_destroy_device_params
     struct unix_device *device;
 };
 
+/* Retrieve the cached device descriptor followed by the raw descriptor set of
+ * every configuration. If the buffer is too small, *needed is set to the
+ * required size and STATUS_BUFFER_TOO_SMALL is returned. */
+struct usb_get_descriptors_params
+{
+    struct unix_device *device;
+    void *buffer;
+    UINT32 size;
+    UINT32 *needed;
+};
+
 enum unix_funcs
 {
     unix_usb_main_loop,
@@ -100,6 +111,7 @@ enum unix_funcs
     unix_usb_submit_urb,
     unix_usb_cancel_transfer,
     unix_usb_destroy_device,
+    unix_usb_get_descriptors,
 };
 
 #endif
