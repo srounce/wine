@@ -435,6 +435,16 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
         return;
     }
 
+    if (caps.Address != 0xffffffff)
+    {
+        DWORD address = caps.Address;
+        SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_ADDRESS, (BYTE *)&address, sizeof(address) );
+    }
+    if (caps.UINumber != 0xffffffff)
+    {
+        DWORD ui_number = caps.UINumber;
+        SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_UI_NUMBER, (BYTE *)&ui_number, sizeof(ui_number) );
+    }
     if (!get_device_id(device, BusQueryContainerID, &id) && id)
     {
         SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_BASE_CONTAINERID, (BYTE *)id,

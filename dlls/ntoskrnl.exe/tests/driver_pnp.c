@@ -415,6 +415,8 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
             caps->SurpriseRemovalOK = 1;
             caps->EjectSupported = 1;
             caps->UniqueID = 1;
+            caps->Address = 0xbeef;
+            caps->UINumber = 12;
 
             caps->DeviceState[PowerSystemWorking] = PowerDeviceD0;
             caps->DeviceState[PowerSystemSleeping1] = PowerDeviceD3;

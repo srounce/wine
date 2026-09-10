@@ -2181,6 +2181,18 @@ static void test_pnp_devices(void)
         ok(!strcmp(buffer, expect_device_location), "Got location information %s.\n", debugstr_a(buffer));
     }
 
+    ret = SetupDiGetDeviceRegistryPropertyA(set, &device, SPDRP_ADDRESS,
+            &type, (BYTE *)&dword, sizeof(dword), NULL);
+    ok(ret, "got error %#lx\n", GetLastError());
+    ok(type == REG_DWORD, "got type %lu\n", type);
+    ok(dword == 0xbeef, "got address %#lx\n", dword);
+
+    ret = SetupDiGetDeviceRegistryPropertyA(set, &device, SPDRP_UI_NUMBER,
+            &type, (BYTE *)&dword, sizeof(dword), NULL);
+    ok(ret, "got error %#lx\n", GetLastError());
+    ok(type == REG_DWORD, "got type %lu\n", type);
+    ok(dword == 12, "got UI number %lu\n", dword);
+
     prop_type = DEVPROP_TYPE_EMPTY;
     size = 0;
     memset(buffer_w, 0, sizeof(buffer_w));
