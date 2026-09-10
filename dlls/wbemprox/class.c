@@ -34,6 +34,7 @@ struct enum_class_object
 {
     IEnumWbemClassObject IEnumWbemClassObject_iface;
     LONG refs;
+    IUnknown *marshal;
     struct query *query;
     UINT index;
     enum wbm_namespace ns;
@@ -61,6 +62,7 @@ static ULONG WINAPI enum_class_object_Release(
     {
         TRACE("destroying %p\n", ec);
         release_query( ec->query );
+        IUnknown_Release( ec->marshal );
         free( ec );
     }
     return refs;
@@ -84,6 +86,10 @@ static HRESULT WINAPI enum_class_object_QueryInterface(
     {
         *ppvObject = &client_security;
         return S_OK;
+    }
+    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
+    {
+        return IUnknown_QueryInterface( ec->marshal, riid, ppvObject );
     }
     else
     {
@@ -209,6 +215,11 @@ HRESULT EnumWbemClassObject_create( struct query *query, LPVOID *ppObj )
 
     ec->IEnumWbemClassObject_iface.lpVtbl = &enum_class_object_vtbl;
     ec->refs  = 1;
+    if (FAILED(CoCreateFreeThreadedMarshaler( (IUnknown *)&ec->IEnumWbemClassObject_iface, &ec->marshal )))
+    {
+        free( ec );
+        return E_OUTOFMEMORY;
+    }
     ec->query = addref_query( query );
     ec->index = 0;
     ec->ns = query->ns;
@@ -274,6 +285,7 @@ struct class_object
 {
     IWbemClassObject IWbemClassObject_iface;
     LONG refs;
+    IUnknown *marshal;
     WCHAR *name;
     IEnumWbemClassObject *iter;
     LONG flags;
@@ -307,6 +319,7 @@ static ULONG WINAPI class_object_Release(
         TRACE("destroying %p\n", co);
         if (co->iter) IEnumWbemClassObject_Release( co->iter );
         destroy_record( co->record );
+        IUnknown_Release( co->marshal );
         free( co->name );
         free( co );
     }
@@ -331,6 +344,10 @@ static HRESULT WINAPI class_object_QueryInterface(
     {
         *ppvObject = &client_security;
         return S_OK;
+    }
+    else if (IsEqualGUID( riid, &IID_IMarshal ))
+    {
+        return IUnknown_QueryInterface( co->marshal, riid, ppvObject );
     }
     else
     {
@@ -1095,9 +1112,15 @@ HRESULT create_class_object( enum wbm_namespace ns, const WCHAR *name, IEnumWbem
 
     co->IWbemClassObject_iface.lpVtbl = &class_object_vtbl;
     co->refs  = 1;
+    if (FAILED(CoCreateFreeThreadedMarshaler( (IUnknown *)&co->IWbemClassObject_iface, &co->marshal )))
+    {
+        free( co );
+        return E_OUTOFMEMORY;
+    }
     if (!name) co->name = NULL;
     else if (!(co->name = wcsdup( name )))
     {
+        IUnknown_Release( co->marshal );
         free( co );
         return E_OUTOFMEMORY;
     }

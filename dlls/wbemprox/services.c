@@ -208,6 +208,7 @@ struct wbem_services
 {
     IWbemServices IWbemServices_iface;
     LONG refs;
+    IUnknown *marshal;
     CRITICAL_SECTION cs;
     enum wbm_namespace ns;
     struct async_header *async;
@@ -247,6 +248,7 @@ static ULONG WINAPI wbem_services_Release(
         DeleteCriticalSection( &ws->cs );
         if (ws->context)
             IWbemContext_Release( ws->context );
+        IUnknown_Release( ws->marshal );
         free( ws );
     }
     return refs;
@@ -270,6 +272,10 @@ static HRESULT WINAPI wbem_services_QueryInterface(
     {
         *ppvObject = &client_security;
         return S_OK;
+    }
+    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
+    {
+        return IUnknown_QueryInterface( ws->marshal, riid, ppvObject );
     }
     else
     {
@@ -993,6 +999,11 @@ HRESULT WbemServices_create( const WCHAR *namespace, IWbemContext *context, LPVO
     ws->IWbemServices_iface.lpVtbl = &wbem_services_vtbl;
     ws->refs      = 1;
     ws->ns        = ns;
+    if (FAILED(CoCreateFreeThreadedMarshaler( (IUnknown *)&ws->IWbemServices_iface, &ws->marshal )))
+    {
+        free( ws );
+        return E_OUTOFMEMORY;
+    }
     InitializeCriticalSectionEx( &ws->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
     ws->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": wbemprox_services.cs");
     if (context)
