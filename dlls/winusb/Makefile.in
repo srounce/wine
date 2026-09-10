@@ -1,4 +1,5 @@
 MODULE    = winusb.dll
+IMPORTLIB = winusb
 
 SOURCES = \
 	main.c
