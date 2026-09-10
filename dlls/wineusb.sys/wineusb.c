@@ -1042,6 +1042,7 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
     {
         case URB_FUNCTION_ABORT_PIPE:
         {
+            struct _URB_PIPE_REQUEST *req = &urb->UrbPipeRequest;
             LIST_ENTRY *entry, *mark;
 
             /* The documentation states that URB_FUNCTION_ABORT_PIPE may
@@ -1056,6 +1057,26 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
                 {
                     .transfer = queued_irp->Tail.Overlay.DriverContext[0],
                 };
+
+                if (req->PipeHandle)
+                {
+                    URB *queued_urb = IoGetCurrentIrpStackLocation(queued_irp)->Parameters.Others.Argument1;
+                    HANDLE pipe;
+
+                    switch (queued_urb->UrbHeader.Function)
+                    {
+                        case URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER:
+                            pipe = queued_urb->UrbBulkOrInterruptTransfer.PipeHandle;
+                            break;
+                        case URB_FUNCTION_CONTROL_TRANSFER:
+                            pipe = queued_urb->UrbControlTransfer.PipeHandle;
+                            break;
+                        default:
+                            pipe = NULL;
+                    }
+                    if (pipe != req->PipeHandle)
+                        continue;
+                }
 
                 WINE_UNIX_CALL(unix_usb_cancel_transfer, &params);
             }
