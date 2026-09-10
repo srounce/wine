@@ -1183,6 +1183,253 @@ static NTSTATUS WINAPI driver_internal_ioctl(DEVICE_OBJECT *device_obj, IRP *irp
     return status;
 }
 
+static UCHAR usb_device_speed(const struct usb_device *device)
+{
+    switch (device->speed)
+    {
+        case USB_SPEED_LOW:
+            return UsbLowSpeed;
+        case USB_SPEED_HIGH:
+            return UsbHighSpeed;
+        case USB_SPEED_SUPER:
+        case USB_SPEED_SUPER_PLUS:
+            return UsbSuperSpeed;
+        default:
+            return UsbFullSpeed;
+    }
+}
+
+/* Find the whole-device child connected at the given port. The bus address
+ * doubles as the port number, so interface PDOs of composite devices, which
+ * share their parent's address, are skipped. Called with wineusb_cs held. */
+static struct usb_device *hub_find_connection(struct usb_hub *hub, ULONG index)
+{
+    struct usb_device *device;
+
+    LIST_FOR_EACH_ENTRY(device, &hub->children, struct usb_device, entry)
+    {
+        if (!device->interface && device->devnum == index)
+            return device;
+    }
+    return NULL;
+}
+
+/* Return the raw descriptor set of the given configuration, cached at
+ * enumeration time. Called with wineusb_cs held. */
+static const UCHAR *get_cached_config_descriptor(const struct usb_device *device,
+        UCHAR index, USHORT *total_len)
+{
+    const UCHAR *descriptors = device->descriptors;
+    uint32_t offset = sizeof(USB_DEVICE_DESCRIPTOR);
+    UCHAR i;
+
+    if (!descriptors)
+        return NULL;
+
+    for (i = 0;; ++i)
+    {
+        USHORT len;
+
+        if (offset + sizeof(USB_CONFIGURATION_DESCRIPTOR) > device->descriptors_len)
+            return NULL;
+        len = descriptors[offset + 2] | (descriptors[offset + 3] << 8);
+        if (offset + len > device->descriptors_len)
+            return NULL;
+        if (i == index)
+        {
+            *total_len = len;
+            return descriptors + offset;
+        }
+        offset += len;
+    }
+}
+
+static NTSTATUS hub_ioctl(struct usb_hub *hub, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+    ULONG inlen = stack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outlen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    void *buffer = irp->AssociatedIrp.SystemBuffer;
+
+    switch (code)
+    {
+        case IOCTL_USB_GET_NODE_INFORMATION:
+        {
+            USB_NODE_INFORMATION *info = buffer;
+
+            if (outlen < sizeof(*info))
+                return STATUS_BUFFER_TOO_SMALL;
+
+            memset(info, 0, sizeof(*info));
+            info->NodeType = UsbHub;
+            info->u.HubInformation.HubDescriptor.bDescriptorLength = 9;
+            info->u.HubInformation.HubDescriptor.bDescriptorType = 0x29;
+            info->u.HubInformation.HubDescriptor.bNumberOfPorts = 127;
+            irp->IoStatus.Information = sizeof(*info);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX:
+        {
+            USB_NODE_CONNECTION_INFORMATION_EX *info = buffer;
+            ULONG size = offsetof(USB_NODE_CONNECTION_INFORMATION_EX, PipeList[0]);
+            struct usb_device *device;
+            ULONG index;
+
+            if (inlen < sizeof(info->ConnectionIndex) || outlen < size)
+                return STATUS_BUFFER_TOO_SMALL;
+
+            index = info->ConnectionIndex;
+            memset(info, 0, size);
+            info->ConnectionIndex = index;
+
+            EnterCriticalSection(&wineusb_cs);
+            if ((device = hub_find_connection(hub, index)))
+            {
+                if (device->descriptors)
+                {
+                    const UCHAR *config;
+                    USHORT config_len;
+
+                    memcpy(&info->DeviceDescriptor, device->descriptors,
+                            min(device->descriptors_len, sizeof(info->DeviceDescriptor)));
+                    if ((config = get_cached_config_descriptor(device, 0, &config_len)))
+                        info->CurrentConfigurationValue = config[5];
+                }
+                info->Speed = usb_device_speed(device);
+                info->DeviceAddress = device->devnum;
+                info->ConnectionStatus = DeviceConnected;
+            }
+            LeaveCriticalSection(&wineusb_cs);
+
+            irp->IoStatus.Information = size;
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2:
+        {
+            USB_NODE_CONNECTION_INFORMATION_EX_V2 *info = buffer;
+            struct usb_device *device;
+            ULONG index;
+
+            if (inlen < sizeof(info->ConnectionIndex) || outlen < sizeof(*info))
+                return STATUS_BUFFER_TOO_SMALL;
+
+            index = info->ConnectionIndex;
+            memset(info, 0, sizeof(*info));
+            info->ConnectionIndex = index;
+            info->Length = sizeof(*info);
+
+            EnterCriticalSection(&wineusb_cs);
+            if ((device = hub_find_connection(hub, index)))
+            {
+                info->SupportedUsbProtocols.ul = 0x03; /* Usb110 | Usb200 */
+                if (device->speed >= USB_SPEED_SUPER)
+                {
+                    info->SupportedUsbProtocols.ul |= 0x04; /* Usb300 */
+                    /* DeviceIsOperatingAtSuperSpeedOrHigher | DeviceIsSuperSpeedCapableOrHigher */
+                    info->Flags.ul = 0x03;
+                }
+            }
+            LeaveCriticalSection(&wineusb_cs);
+
+            irp->IoStatus.Information = sizeof(*info);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION:
+        {
+            USB_DESCRIPTOR_REQUEST *req = buffer;
+            ULONG header_len = offsetof(USB_DESCRIPTOR_REQUEST, Data[0]);
+            struct usb_device *device;
+            NTSTATUS status;
+            ULONG copied = 0;
+
+            if (inlen < header_len || outlen < header_len)
+                return STATUS_BUFFER_TOO_SMALL;
+
+            EnterCriticalSection(&wineusb_cs);
+            if (!(device = hub_find_connection(hub, req->ConnectionIndex)) || !device->descriptors)
+            {
+                status = STATUS_DEVICE_NOT_CONNECTED;
+            }
+            else
+            {
+                UCHAR type = req->SetupPacket.wValue >> 8;
+                ULONG space = min(outlen - header_len, req->SetupPacket.wLength);
+
+                switch (type)
+                {
+                    case USB_DEVICE_DESCRIPTOR_TYPE:
+                        copied = min(space, min(device->descriptors_len, sizeof(USB_DEVICE_DESCRIPTOR)));
+                        memcpy(req->Data, device->descriptors, copied);
+                        status = STATUS_SUCCESS;
+                        break;
+
+                    case USB_CONFIGURATION_DESCRIPTOR_TYPE:
+                    {
+                        USHORT config_len;
+                        const UCHAR *config = get_cached_config_descriptor(device,
+                                req->SetupPacket.wValue & 0xff, &config_len);
+
+                        if (config)
+                        {
+                            copied = min(space, config_len);
+                            memcpy(req->Data, config, copied);
+                            status = STATUS_SUCCESS;
+                        }
+                        else
+                        {
+                            status = STATUS_UNSUCCESSFUL;
+                        }
+                        break;
+                    }
+
+                    default:
+                        FIXME("Unhandled descriptor type %#x.\n", type);
+                        status = STATUS_NOT_SUPPORTED;
+                }
+            }
+            LeaveCriticalSection(&wineusb_cs);
+
+            if (!status)
+                irp->IoStatus.Information = header_len + copied;
+            return status;
+        }
+
+        default:
+            FIXME("Unhandled ioctl %#lx (device %#lx, access %#lx, function %#lx, method %#lx).\n",
+                    code, code >> 16, (code >> 14) & 3, (code >> 2) & 0xfff, code & 3);
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    struct usb_object *obj = device_obj->DeviceExtension;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+
+    TRACE("device_obj %p, irp %p, code %#lx.\n", device_obj, irp,
+            stack->Parameters.DeviceIoControl.IoControlCode);
+
+    switch (obj->kind)
+    {
+        case DEVICE_KIND_HUB:
+            status = hub_ioctl((struct usb_hub *)obj, irp);
+            break;
+
+        default:
+            FIXME("Unhandled ioctl %#lx for device kind %u.\n",
+                    stack->Parameters.DeviceIoControl.IoControlCode, obj->kind);
+    }
+
+    irp->IoStatus.Status = status;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return status;
+}
+
 static NTSTATUS WINAPI driver_create(DEVICE_OBJECT *device, IRP *irp)
 {
     TRACE("device %p, irp %p.\n", device, irp);
@@ -1245,6 +1492,7 @@ NTSTATUS WINAPI DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *path)
     driver->DriverUnload = driver_unload;
     driver->MajorFunction[IRP_MJ_CREATE] = driver_create;
     driver->MajorFunction[IRP_MJ_CLOSE] = driver_close;
+    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = driver_ioctl;
     driver->MajorFunction[IRP_MJ_PNP] = driver_pnp;
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = driver_internal_ioctl;
 
