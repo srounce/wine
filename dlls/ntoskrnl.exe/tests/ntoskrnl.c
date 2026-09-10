@@ -2173,13 +2173,10 @@ static void test_pnp_devices(void)
 
     ret = SetupDiGetDeviceRegistryPropertyA(set, &device, SPDRP_LOCATION_INFORMATION, &type, (BYTE *)buffer,
             sizeof(buffer), &size);
-    todo_wine ok(ret, "Got error %#lx.\n", GetLastError());
-    if (ret)
-    {
-        ok(type == REG_SZ, "Got type %lu.\n", type);
-        ok(size == sizeof(expect_device_location), "Got size %lu.\n", size);
-        ok(!strcmp(buffer, expect_device_location), "Got location information %s.\n", debugstr_a(buffer));
-    }
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(type == REG_SZ, "Got type %lu.\n", type);
+    ok(size == sizeof(expect_device_location), "Got size %lu.\n", size);
+    ok(!strcmp(buffer, expect_device_location), "Got location information %s.\n", debugstr_a(buffer));
 
     ret = SetupDiGetDeviceRegistryPropertyA(set, &device, SPDRP_ADDRESS,
             &type, (BYTE *)&dword, sizeof(dword), NULL);
@@ -2240,13 +2237,10 @@ static void test_pnp_devices(void)
     memset(buffer_w, 0, sizeof(buffer_w));
     ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_LocationInfo, &prop_type, (BYTE *)buffer_w,
                                     sizeof(buffer_w), &size, 0);
-    todo_wine ok(ret, "Got error %#lx.\n", GetLastError());
-    if (ret)
-    {
-        ok(prop_type == DEVPROP_TYPE_STRING, "got type %#lx\n", prop_type);
-        ok(size == sizeof(expect_device_location_w), "Got size %lu.\n", size);
-        ok(!wcscmp(buffer_w, expect_device_location_w), "Got device location info %s.\n", debugstr_w(buffer_w));
-    }
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(prop_type == DEVPROP_TYPE_STRING, "got type %#lx\n", prop_type);
+    ok(size == sizeof(expect_device_location_w), "Got size %lu.\n", size);
+    ok(!wcscmp(buffer_w, expect_device_location_w), "Got device location info %s.\n", debugstr_w(buffer_w));
 
     /* DEVPKEY_Device_Parent — should be set by ntoskrnl during bus enumeration. */
     prop_type = DEVPROP_TYPE_EMPTY;
