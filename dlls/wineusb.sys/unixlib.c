@@ -567,6 +567,33 @@ static NTSTATUS usb_submit_urb(void *args)
             return STATUS_PENDING;
         }
 
+        case URB_FUNCTION_SELECT_INTERFACE:
+        {
+            struct _URB_SELECT_INTERFACE *req = &urb->UrbSelectInterface;
+            ULONG i;
+
+            /* usbfs claims the interface automatically on I/O, but an
+             * explicit claim is required to change the alternate setting. */
+            if ((ret = libusb_claim_interface(handle, req->Interface.InterfaceNumber)) < 0)
+                WARN("Failed to claim interface %u: %s\n",
+                        req->Interface.InterfaceNumber, libusb_strerror(ret));
+
+            if ((ret = libusb_set_interface_alt_setting(handle,
+                    req->Interface.InterfaceNumber, req->Interface.AlternateSetting)) < 0)
+            {
+                ERR("Failed to set alternate setting: %s\n", libusb_strerror(ret));
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            for (i = 0; i < req->Interface.NumberOfPipes; ++i)
+            {
+                USBD_PIPE_INFORMATION *pipe = &req->Interface.Pipes[i];
+                pipe->PipeHandle = make_pipe_handle(pipe->EndpointAddress, pipe->PipeType);
+            }
+
+            return STATUS_SUCCESS;
+        }
+
         case URB_FUNCTION_SELECT_CONFIGURATION:
         {
             struct _URB_SELECT_CONFIGURATION *req = &urb->UrbSelectConfiguration;
