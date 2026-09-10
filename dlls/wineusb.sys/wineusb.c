@@ -67,12 +67,25 @@ DECLARE_CRITICAL_SECTION(wineusb_cs);
 
 static struct list device_list = LIST_INIT(device_list);
 
+enum device_kind
+{
+    DEVICE_KIND_FDO,
+    DEVICE_KIND_DEVICE,
+};
+
+/* Common header of every device extension created by this driver. */
+struct usb_object
+{
+    enum device_kind kind;
+    DEVICE_OBJECT *device_obj;
+};
+
 struct usb_device
 {
+    struct usb_object obj;
+
     struct list entry;
     BOOL removed;
-
-    DEVICE_OBJECT *device_obj;
 
     bool interface;
     int16_t interface_index;
@@ -129,7 +142,8 @@ static void add_unix_device(const struct usb_add_device_event *event)
     }
 
     device = device_obj->DeviceExtension;
-    device->device_obj = device_obj;
+    device->obj.kind = DEVICE_KIND_DEVICE;
+    device->obj.device_obj = device_obj;
     device->unix_device = event->device;
     InitializeListHead(&device->irp_list);
     device->removed = FALSE;
@@ -288,8 +302,8 @@ static NTSTATUS fdo_pnp(IRP *irp)
 
             LIST_FOR_EACH_ENTRY(device, &device_list, struct usb_device, entry)
             {
-                devices->Objects[i++] = device->device_obj;
-                call_fastcall_func1(ObfReferenceObject, device->device_obj);
+                devices->Objects[i++] = device->obj.device_obj;
+                call_fastcall_func1(ObfReferenceObject, device->obj.device_obj);
             }
 
             LeaveCriticalSection(&wineusb_cs);
@@ -341,7 +355,7 @@ static NTSTATUS fdo_pnp(IRP *irp)
                 list_remove(&device->entry);
                 if (device->descriptors)
                     ExFreePool(device->descriptors);
-                IoDeleteDevice(device->device_obj);
+                IoDeleteDevice(device->obj.device_obj);
             }
             LeaveCriticalSection(&wineusb_cs);
 
@@ -542,7 +556,7 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
             if (device->descriptors)
                 ExFreePool(device->descriptors);
-            IoDeleteDevice(device->device_obj);
+            IoDeleteDevice(device->obj.device_obj);
             ret = STATUS_SUCCESS;
             break;
 
@@ -561,7 +575,9 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
 static NTSTATUS WINAPI driver_pnp(DEVICE_OBJECT *device, IRP *irp)
 {
-    if (device == bus_fdo)
+    struct usb_object *obj = device->DeviceExtension;
+
+    if (obj->kind == DEVICE_KIND_FDO)
         return fdo_pnp(irp);
     return pdo_pnp(device, irp);
 }
@@ -717,11 +733,14 @@ static NTSTATUS WINAPI driver_add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *p
 
     TRACE("driver %p, pdo %p.\n", driver, pdo);
 
-    if ((ret = IoCreateDevice(driver, 0, NULL, FILE_DEVICE_BUS_EXTENDER, 0, FALSE, &bus_fdo)))
+    if ((ret = IoCreateDevice(driver, sizeof(struct usb_object), NULL, FILE_DEVICE_BUS_EXTENDER, 0, FALSE, &bus_fdo)))
     {
         ERR("Failed to create FDO, status %#lx.\n", ret);
         return ret;
     }
+
+    ((struct usb_object *)bus_fdo->DeviceExtension)->kind = DEVICE_KIND_FDO;
+    ((struct usb_object *)bus_fdo->DeviceExtension)->device_obj = bus_fdo;
 
     IoAttachDeviceToDeviceStack(bus_fdo, pdo);
     bus_pdo = pdo;
