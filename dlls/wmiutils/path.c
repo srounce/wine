@@ -50,6 +50,7 @@ struct path
 {
     IWbemPath        IWbemPath_iface;
     LONG             refs;
+    IUnknown        *marshal;
     CRITICAL_SECTION cs;
     WCHAR           *text;
     int              len_text;
@@ -339,6 +340,7 @@ static ULONG WINAPI path_Release(
     if (!refs)
     {
         TRACE("destroying %p\n", path);
+        if (path->marshal) IUnknown_Release( path->marshal );
         clear_path( path );
         path->cs.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection( &path->cs );
@@ -360,6 +362,13 @@ static HRESULT WINAPI path_QueryInterface(
          IsEqualGUID( riid, &IID_IUnknown ) )
     {
         *ppvObject = iface;
+    }
+    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
+    {
+        /* The object is apartment-neutral, like on Windows; this is what
+         * .NET System.Management relies on when using it from an STA
+         * thread. */
+        return IUnknown_QueryInterface( path->marshal, riid, ppvObject );
     }
     else
     {
@@ -1300,6 +1309,11 @@ HRESULT WbemPath_create( LPVOID *ppObj )
 
     path->IWbemPath_iface.lpVtbl = &path_vtbl;
     path->refs = 1;
+    if (FAILED(CoCreateFreeThreadedMarshaler( (IUnknown *)&path->IWbemPath_iface, &path->marshal )))
+    {
+        free( path );
+        return E_OUTOFMEMORY;
+    }
     InitializeCriticalSectionEx( &path->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
     path->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": wmiutils_path.cs");
     init_path( path );
