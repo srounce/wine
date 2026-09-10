@@ -913,6 +913,7 @@ static const struct reg_property reg_props[] = {
 static const struct reg_property invalid_reg_props[] = {
     { SPDRP_CAPABILITIES, REG_DWORD, (BYTE *)&dword, sizeof(dword), DEVPROP_TYPE_INT32, (BYTE *)&dword, sizeof(dword), ERROR_ACCESS_DENIED },
     { SPDRP_UI_NUMBER, REG_DWORD, (BYTE *)&dword, sizeof(dword), DEVPROP_TYPE_INT32, (BYTE *)&dword, sizeof(dword), ERROR_ACCESS_DENIED },
+    { SPDRP_ADDRESS, REG_DWORD, (BYTE *)&dword, sizeof(dword), DEVPROP_TYPE_UINT32, (BYTE *)&dword, sizeof(dword), ERROR_ACCESS_DENIED },
     { SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, REG_SZ, (BYTE *)strw, sizeof(strw), DEVPROP_TYPE_STRING, (BYTE *)strw, sizeof(strw), ERROR_ACCESS_DENIED },
     { SPDRP_BASE_CONTAINERID, REG_SZ, (BYTE *)guid_strw, sizeof(guid_strw), DEVPROP_TYPE_GUID, (BYTE *)&guid, sizeof(guid), ERROR_INVALID_REG_PROPERTY },
 };
