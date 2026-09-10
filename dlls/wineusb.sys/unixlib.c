@@ -410,6 +410,15 @@ static void LIBUSB_CALL transfer_cb(struct libusb_transfer *transfer)
                 break;
             }
 
+            case URB_FUNCTION_CONTROL_TRANSFER:
+            {
+                struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
+                req->TransferBufferLength = transfer->actual_length;
+                if (req->SetupPacket[0] & LIBUSB_ENDPOINT_IN)
+                    memcpy(transfer_buffer, libusb_control_transfer_get_data(transfer), transfer->actual_length);
+                break;
+            }
+
             default:
                 ERR("Unexpected function %#x.\n", urb->UrbHeader.Function);
         }
@@ -576,6 +585,43 @@ static NTSTATUS usb_submit_urb(void *args)
             }
 
             return STATUS_SUCCESS;
+        }
+
+        case URB_FUNCTION_CONTROL_TRANSFER:
+        {
+            struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
+            struct transfer_ctx *transfer_ctx;
+            unsigned char *buffer;
+
+            if (!(transfer_ctx = calloc(1, sizeof(*transfer_ctx))))
+                return STATUS_NO_MEMORY;
+            transfer_ctx->irp = irp;
+            transfer_ctx->transfer_buffer = params->transfer_buffer;
+
+            if (!(transfer = libusb_alloc_transfer(0)))
+            {
+                free(transfer_ctx);
+                return STATUS_NO_MEMORY;
+            }
+            irp->Tail.Overlay.DriverContext[0] = transfer;
+
+            if (!(buffer = malloc(sizeof(struct libusb_control_setup) + req->TransferBufferLength)))
+            {
+                free(transfer_ctx);
+                libusb_free_transfer(transfer);
+                return STATUS_NO_MEMORY;
+            }
+
+            memcpy(buffer, req->SetupPacket, sizeof(req->SetupPacket));
+            if (!(req->SetupPacket[0] & LIBUSB_ENDPOINT_IN))
+                memcpy(buffer + LIBUSB_CONTROL_SETUP_SIZE, params->transfer_buffer, req->TransferBufferLength);
+            libusb_fill_control_transfer(transfer, handle, buffer, transfer_cb, transfer_ctx, 0);
+            transfer->flags = LIBUSB_TRANSFER_FREE_BUFFER | LIBUSB_TRANSFER_FREE_TRANSFER;
+            ret = libusb_submit_transfer(transfer);
+            if (ret < 0)
+                ERR("Failed to submit control transfer: %s\n", libusb_strerror(ret));
+
+            return STATUS_PENDING;
         }
 
         case URB_FUNCTION_VENDOR_DEVICE:

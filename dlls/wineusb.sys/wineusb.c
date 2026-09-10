@@ -1068,6 +1068,7 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
         case URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER:
         case URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE:
         case URB_FUNCTION_SELECT_CONFIGURATION:
+        case URB_FUNCTION_CONTROL_TRANSFER:
         case URB_FUNCTION_VENDOR_DEVICE:
         case URB_FUNCTION_VENDOR_INTERFACE:
         case URB_FUNCTION_VENDOR_ENDPOINT:
@@ -1093,6 +1094,16 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
                 case URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE:
                 {
                     struct _URB_CONTROL_DESCRIPTOR_REQUEST *req = &urb->UrbControlDescriptorRequest;
+                    if (req->TransferBufferMDL)
+                        params.transfer_buffer = MmGetSystemAddressForMdlSafe(req->TransferBufferMDL, NormalPagePriority);
+                    else
+                        params.transfer_buffer = req->TransferBuffer;
+                    break;
+                }
+
+                case URB_FUNCTION_CONTROL_TRANSFER:
+                {
+                    struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
                     if (req->TransferBufferMDL)
                         params.transfer_buffer = MmGetSystemAddressForMdlSafe(req->TransferBufferMDL, NormalPagePriority);
                     else
