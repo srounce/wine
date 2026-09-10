@@ -1405,6 +1405,68 @@ static NTSTATUS hub_ioctl(struct usb_hub *hub, IRP *irp)
     }
 }
 
+static NTSTATUS controller_ioctl(struct usb_controller *controller, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+    ULONG outlen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    void *buffer = irp->AssociatedIrp.SystemBuffer;
+
+    switch (code)
+    {
+        case IOCTL_USB_GET_ROOT_HUB_NAME:
+        {
+            USB_ROOT_HUB_NAME *name = buffer;
+            ULONG header_len = offsetof(USB_ROOT_HUB_NAME, RootHubName[0]);
+            const WCHAR *link;
+            ULONG needed, len;
+
+            if (outlen < sizeof(name->ActualLength))
+                return STATUS_BUFFER_TOO_SMALL;
+
+            EnterCriticalSection(&wineusb_cs);
+            if (!controller->hub || !controller->hub->obj.link_name.Buffer)
+            {
+                LeaveCriticalSection(&wineusb_cs);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            /* Strip the "\??\" prefix; the caller expects a name it can
+             * prepend "\\.\" to. */
+            link = controller->hub->obj.link_name.Buffer + 4;
+            len = wcslen(link);
+            needed = header_len + (len + 1) * sizeof(WCHAR);
+
+            name->ActualLength = needed;
+            if (outlen >= needed)
+            {
+                memcpy(name->RootHubName, link, (len + 1) * sizeof(WCHAR));
+                irp->IoStatus.Information = needed;
+            }
+            else
+            {
+                if (outlen > header_len)
+                {
+                    len = (outlen - header_len) / sizeof(WCHAR);
+                    if (len)
+                    {
+                        memcpy(name->RootHubName, link, (len - 1) * sizeof(WCHAR));
+                        name->RootHubName[len - 1] = 0;
+                    }
+                }
+                irp->IoStatus.Information = min(outlen, needed);
+            }
+            LeaveCriticalSection(&wineusb_cs);
+            return STATUS_SUCCESS;
+        }
+
+        default:
+            FIXME("Unhandled ioctl %#lx (device %#lx, access %#lx, function %#lx, method %#lx).\n",
+                    code, code >> 16, (code >> 14) & 3, (code >> 2) & 0xfff, code & 3);
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
 static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
 {
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
@@ -1416,6 +1478,10 @@ static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
 
     switch (obj->kind)
     {
+        case DEVICE_KIND_CONTROLLER:
+            status = controller_ioctl((struct usb_controller *)obj, irp);
+            break;
+
         case DEVICE_KIND_HUB:
             status = hub_ioctl((struct usb_hub *)obj, irp);
             break;
