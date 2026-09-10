@@ -1193,6 +1193,7 @@ SOURCES = \
 	winternl.h \
 	wintrust.h \
 	winusb.h \
+	winusbio.h \
 	winuser.h \
 	winuser.rh \
 	winver.h \
