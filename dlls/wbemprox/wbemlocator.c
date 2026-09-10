@@ -34,6 +34,7 @@ typedef struct
 {
     IWbemLocator IWbemLocator_iface;
     LONG refs;
+    IUnknown *marshal;
 } wbem_locator;
 
 static inline wbem_locator *impl_from_IWbemLocator( IWbemLocator *iface )
@@ -56,6 +57,7 @@ static ULONG WINAPI wbem_locator_Release(
     if (!refs)
     {
         TRACE("destroying %p\n", wl);
+        IUnknown_Release( wl->marshal );
         free( wl );
     }
     return refs;
@@ -74,6 +76,10 @@ static HRESULT WINAPI wbem_locator_QueryInterface(
          IsEqualGUID( riid, &IID_IUnknown ) )
     {
         *ppvObject = iface;
+    }
+    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
+    {
+        return IUnknown_QueryInterface( This->marshal, riid, ppvObject );
     }
     else
     {
@@ -216,6 +222,11 @@ HRESULT WbemLocator_create( LPVOID *ppObj, REFIID riid )
 
     wl->IWbemLocator_iface.lpVtbl = &wbem_locator_vtbl;
     wl->refs = 1;
+    if (FAILED(CoCreateFreeThreadedMarshaler( (IUnknown *)&wl->IWbemLocator_iface, &wl->marshal )))
+    {
+        free( wl );
+        return E_OUTOFMEMORY;
+    }
 
     *ppObj = &wl->IWbemLocator_iface;
 
