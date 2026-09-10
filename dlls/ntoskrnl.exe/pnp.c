@@ -652,6 +652,13 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
         ExFreePool( id );
     }
 
+    if (!get_device_text(device, DeviceTextLocationInformation, &id) && id)
+    {
+        SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_LOCATION_INFORMATION, (BYTE *)id,
+                (lstrlenW( id ) + 1) * sizeof(WCHAR) );
+        ExFreePool( id );
+    }
+
     if (!get_device_instance_id( parent_device, parent_id ))
         SetupDiSetDevicePropertyW( set, &sp_device, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
                 (BYTE *)parent_id, (wcslen( parent_id ) + 1) * sizeof(WCHAR), 0 );
