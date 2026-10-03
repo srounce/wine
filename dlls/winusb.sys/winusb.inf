@@ -8,6 +8,7 @@ Wine=mfg_section
 
 [mfg_section]
 WinUSB device=device_section,USB\Class_ff
+WinUSB DFU device=device_section,USB\Class_fe&SubClass_01
 
 [device_section.Services]
 AddService = WinUSB,0x2,svc_section

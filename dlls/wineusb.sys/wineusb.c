@@ -725,6 +725,19 @@ static NTSTATUS hub_query_id(struct usb_hub *hub, IRP *irp, BUS_QUERY_ID_TYPE ty
     return STATUS_SUCCESS;
 }
 
+static void hub_set_compat_filters(struct usb_hub *hub)
+{
+    static const WCHAR filters[] = L"USBHUB3\0";
+    WCHAR path[96];
+    NTSTATUS status;
+
+    swprintf(path, ARRAY_SIZE(path),
+            L"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\USB\\ROOT_HUB30\\%u", hub->busnum);
+    if ((status = RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, path, L"LowerFilters",
+            REG_MULTI_SZ, (void *)filters, sizeof(filters))))
+        WARN("Failed to set LowerFilters for %s, status %#lx.\n", debugstr_w(path), status);
+}
+
 static NTSTATUS controller_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 {
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
@@ -839,6 +852,7 @@ static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
             caps->RawDeviceOK = 1;
             caps->UniqueID = 1;
+            caps->Address = 0;
 
             ret = STATUS_SUCCESS;
             break;
@@ -881,6 +895,7 @@ static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         case IRP_MN_START_DEVICE:
+            hub_set_compat_filters(hub);
             register_device_interface(&hub->obj);
             EnterCriticalSection(&wineusb_cs);
             hub->started = TRUE;
