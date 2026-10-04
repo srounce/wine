@@ -3382,7 +3382,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetOverlappedResult( HANDLE file, LPOVERLAPPED ove
 
     *result = overlapped->InternalHigh;
     SetLastError( RtlNtStatusToDosError( status ));
-    return !status || status == STATUS_PENDING;
+    return !status || status == STATUS_PENDING || status == STATUS_TIMEOUT;
 }
 
 
@@ -3426,7 +3426,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetOverlappedResultEx( HANDLE file, OVERLAPPED *ov
     }
     *result = overlapped->InternalHigh;
     SetLastError( RtlNtStatusToDosError( status ));
-    return !status || status == STATUS_PENDING;
+    return !status || status == STATUS_PENDING || status == STATUS_TIMEOUT;
 }
 
 
