@@ -782,7 +782,7 @@ static void set_axis_type( DIDEVICEOBJECTINSTANCEW *instance, BOOL *seen, DWORD 
 static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter, DWORD flags,
                           enum_object_callback callback, void *data )
 {
-    DWORD collection = 0, object = 0, axis = 0, button = 0, pov = 0, value_ofs = 0, button_ofs = 0, j, count, len;
+    DWORD object = 0, axis = 0, button = 0, pov = 0, value_ofs = 0, button_ofs = 0, j, count, len;
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)impl->preparsed;
     DIDEVICEOBJECTINSTANCEW instance = {.dwSize = sizeof(DIDEVICEOBJECTINSTANCEW)};
     struct hid_value_caps *caps, *caps_end, *nary, *nary_end, *effect_caps;
@@ -972,8 +972,10 @@ static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter,
         if (!node->usage_page) continue;
         if (node->usage_page < HID_USAGE_PAGE_VENDOR_DEFINED_BEGIN)
         {
+            /* instance must match the link collection index used by wCollectionNumber */
             instance.dwOfs = 0;
-            instance.dwType = DIDFT_COLLECTION | DIDFT_MAKEINSTANCE( collection++ ) | DIDFT_NODATA;
+            instance.dwType = DIDFT_COLLECTION | DIDFT_NODATA |
+                              DIDFT_MAKEINSTANCE( node - HID_COLLECTION_NODES( preparsed ) );
             instance.dwFlags = 0;
             instance.wUsagePage = node->usage_page;
             instance.wUsage = node->usage;
@@ -1044,7 +1046,7 @@ static HRESULT hid_joystick_get_property( IDirectInputDevice8W *iface, DWORD pro
     case (DWORD_PTR)DIPROP_VIDPID:
     {
         DIPROPDWORD *value = (DIPROPDWORD *)header;
-        if (!impl->attrs.VendorID || !impl->attrs.ProductID) return DIERR_UNSUPPORTED;
+        if (!impl->attrs.VendorID) return DIERR_UNSUPPORTED;
         value->dwData = MAKELONG( impl->attrs.VendorID, impl->attrs.ProductID );
         return DI_OK;
     }

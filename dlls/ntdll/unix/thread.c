@@ -81,7 +81,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(threadname);
 
+/* Number of threads with a TEB. System threads (PsCreateSystemThread) are not
+ * counted: they run Unix code with the server signals blocked, so they never
+ * handle SIGQUIT when the process is terminated. Counting them would keep the
+ * last Windows thread from calling abort_process(), leaving the process alive
+ * with only helper threads (e.g. winepulse's main loop) in it. */
 static LONG nb_threads = 1;
+
+static inline BOOL is_counted_thread( const struct thread_data *data )
+{
+    return data && data->teb;
+}
 
 static inline int get_unix_exit_code( NTSTATUS status )
 {
@@ -1317,10 +1327,10 @@ static NTSTATUS spawn_thread( struct thread_data *data )
     pthread_attr_setstack( &attr, get_kernel_stack( data ), kernel_stack_size );
     pthread_attr_setguardsize( &attr, 0 );
     pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
-    InterlockedIncrement( &nb_threads );
+    if (is_counted_thread( data )) InterlockedIncrement( &nb_threads );
     if (pthread_create( &pthread_id, &attr, (void * (*)(void *))server_init_thread, data ))
     {
-        InterlockedDecrement( &nb_threads );
+        if (is_counted_thread( data )) InterlockedDecrement( &nb_threads );
         status = STATUS_NO_MEMORY;
     }
     pthread_attr_destroy( &attr );
@@ -1497,7 +1507,8 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 void abort_thread( int status )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
-    if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
+    if (is_counted_thread( get_thread_data() ) && InterlockedDecrement( &nb_threads ) <= 0)
+        abort_process( status );
     pthread_exit_wrapper( status );
 }
 
@@ -1521,7 +1532,8 @@ static DECLSPEC_NORETURN void exit_thread( int status )
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
-    if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
+    if (is_counted_thread( get_thread_data() ) && InterlockedDecrement( &nb_threads ) <= 0)
+        exit_process( status );
 
     if ((data = InterlockedExchangePointer( &prev_data, get_thread_data() )))
     {
