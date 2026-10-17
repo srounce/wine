@@ -1061,14 +1061,23 @@ static BOOL async_wait_proc( void *user, ULONG_PTR *info, unsigned int *status )
 {
     async_commio *commio = user;
     int fd, needs_close;
+    NTSTATUS ret;
 
     if (*status != STATUS_ALERTED)
     {
+        if (*status == STATUS_SUCCESS)  /* the event mask was changed */
+        {
+            *commio->events = 0;
+            *info = sizeof(*commio->events);
+        }
         release_fileio( &commio->io );
         return TRUE;
     }
 
-    if (!server_get_unix_fd( commio->handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL ))
+    ret = server_get_unix_fd( commio->handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL );
+    /* the handle was closed; restart the wait, the server cancels it with the last handle */
+    if (ret == STATUS_INVALID_HANDLE) return FALSE;
+    if (!ret)
     {
         serial_irq_info new_irq_info;
         UINT new_mstat, dummy, history;

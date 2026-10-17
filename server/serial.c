@@ -62,6 +62,7 @@ struct wait_req
 
 static void serial_dump( struct object *obj, int verbose );
 static struct fd *serial_get_fd( struct object *obj );
+static int serial_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
 static void serial_destroy(struct object *obj);
 
 static enum server_fd_type serial_get_fd_type( struct fd *fd );
@@ -97,6 +98,7 @@ static const struct object_ops serial_ops =
     .dump     = serial_dump,
     .get_fd   = serial_get_fd,
     .get_sync = default_fd_get_sync,
+    .close_handle = serial_close_handle,
     .destroy  = serial_destroy,
 };
 
@@ -213,6 +215,15 @@ static struct fd *serial_get_fd( struct object *obj )
     return (struct fd *)grab_object( serial->fd );
 }
 
+static int serial_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
+{
+    struct serial *serial = (struct serial *)obj;
+
+    /* closing the last handle cancels a pending wait */
+    if (obj->handle_count == 1) async_wake_up( &serial->wait_q, STATUS_CANCELLED );
+    return 1;
+}
+
 static void serial_destroy( struct object *obj)
 {
     struct serial *serial = (struct serial *)obj;
@@ -305,7 +316,8 @@ static void serial_ioctl( struct fd *fd, ioctl_code_t code, struct async *async 
             set_fd_events( serial->rx_fd, (serial->eventmask & SERIAL_EV_RXCHAR) ? POLLIN : 0 );
         }
         serial->history = 0;
-        async_wake_up( &serial->wait_q, STATUS_CANCELLED );
+        /* a pending wait completes successfully, with no events */
+        async_wake_up( &serial->wait_q, STATUS_SUCCESS );
         return;
 
     case IOCTL_SERIAL_WAIT_ON_MASK:
