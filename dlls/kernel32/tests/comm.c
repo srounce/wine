@@ -26,6 +26,7 @@
 #include "winternl.h"
 #include "winbase.h"
 #include "winnls.h"
+#include "winreg.h"
 
 #define TIMEOUT 1000   /* one second for Timeouts*/
 #define SLOWBAUD 150
@@ -2878,6 +2879,143 @@ done:
     CloseHandle(hcom);
 }
 
+#define MAX_COM_PORTS 256
+
+static void test_port_numbers(void)
+{
+    /* a distinct rate for each open port; 1200 is left out, it resets some boards */
+    static const DWORD rates[] = { 600, 2400, 4800, 9600, 19200, 38400, 57600, 115200 };
+    static HANDLE ports[MAX_COM_PORTS + 1];
+    static DCB saved[MAX_COM_PORTS + 1];
+    static DWORD expected[MAX_COM_PORTS + 1];
+    static BOOL usable[MAX_COM_PORTS + 1];
+    static BYTE comdb[4096 / 8];
+    BOOL listed[MAX_COM_PORTS + 1] = { 0 };
+    DWORD i, n, count = 0, size, type, len;
+    WCHAR name[64], value[16], path[16], *end;
+    HANDLE hcom;
+    LSTATUS ret;
+    BOOL res;
+    HKEY key;
+    DCB dcb;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_QUERY_VALUE, &key))
+    {
+        skip("No SERIALCOMM key.\n");
+        return;
+    }
+    for (i = 0;; i++)
+    {
+        len = ARRAY_SIZE(name);
+        size = sizeof(value) - sizeof(WCHAR);
+        memset(value, 0, sizeof(value));
+        ret = RegEnumValueW(key, i, name, &len, NULL, &type, (BYTE *)value, &size);
+        if (ret == ERROR_NO_MORE_ITEMS) break;
+        ok(!ret, "RegEnumValueW returned %ld.\n", ret);
+        if (ret) break;
+        ok(type == REG_SZ, "%s: got type %lu.\n", wine_dbgstr_w(name), type);
+        n = wcsncmp(value, L"COM", 3) ? 0 : wcstoul(value + 3, &end, 10);
+        if (!n || n > MAX_COM_PORTS || *end)
+        {
+            trace("%s: skipping port %s.\n", wine_dbgstr_w(name), wine_dbgstr_w(value));
+            continue;
+        }
+        ok(!listed[n], "COM%lu is listed twice.\n", n);
+        listed[n] = TRUE;
+        count++;
+    }
+    RegCloseKey(key);
+    if (!count)
+    {
+        skip("No COM port listed.\n");
+        return;
+    }
+
+    /* every listed number is claimed in the COM port database */
+    size = sizeof(comdb);
+    ret = RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\COM Name Arbiter",
+                       L"ComDB", RRF_RT_REG_BINARY, NULL, comdb, &size);
+    ok(!ret, "Can't read ComDB, error %ld.\n", ret);
+    for (n = 1; !ret && n <= MAX_COM_PORTS; n++)
+        if (listed[n])
+            ok(n <= size * 8 && (comdb[(n - 1) / 8] & (1 << ((n - 1) % 8))),
+               "COM%lu is not claimed in ComDB.\n", n);
+
+    /* every listed port opens as a serial port */
+    for (n = 1; n <= MAX_COM_PORTS; n++)
+    {
+        usable[n] = FALSE;
+        if (!listed[n]) continue;
+        swprintf(path, ARRAY_SIZE(path), L"\\\\.\\COM%lu", n);
+        hcom = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (hcom == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED)
+        {
+            trace("COM%lu is in use.\n", n);
+            continue;
+        }
+        ok(hcom != INVALID_HANDLE_VALUE, "Can't open listed COM%lu, error %lu.\n", n, GetLastError());
+        if (hcom == INVALID_HANDLE_VALUE) continue;
+        SetLastError(0xdeadbeef);
+        usable[n] = GetCommState(hcom, &saved[n]);
+        ok(usable[n], "Listed COM%lu is not a serial port, error %lu.\n", n, GetLastError());
+        CloseHandle(hcom);
+    }
+
+    /* every port is a device of its own: it still opens while all the others are open... */
+    for (n = 1; n <= MAX_COM_PORTS; n++)
+    {
+        ports[n] = INVALID_HANDLE_VALUE;
+        if (!usable[n]) continue;
+        swprintf(path, ARRAY_SIZE(path), L"\\\\.\\COM%lu", n);
+        ports[n] = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        ok(ports[n] != INVALID_HANDLE_VALUE, "COM%lu doesn't open while the other ports are open, error %lu.\n",
+           n, GetLastError());
+    }
+
+    /* ... and a rate set through one name doesn't show up through another one */
+    for (n = 1, i = 0; n <= MAX_COM_PORTS; n++)
+    {
+        expected[n] = 0;
+        if (ports[n] == INVALID_HANDLE_VALUE) continue;
+        if (i == ARRAY_SIZE(rates))
+        {
+            trace("COM%lu: no distinct rate left.\n", n);
+            continue;
+        }
+        dcb = saved[n];
+        dcb.BaudRate = rates[i++];
+        res = SetCommState(ports[n], &dcb);
+        ok(res, "COM%lu: SetCommState failed, error %lu.\n", n, GetLastError());
+        if (res) expected[n] = dcb.BaudRate;
+    }
+    for (n = 1; n <= MAX_COM_PORTS; n++)
+    {
+        if (!expected[n]) continue;
+        res = GetCommState(ports[n], &dcb);
+        ok(res, "COM%lu: GetCommState failed, error %lu.\n", n, GetLastError());
+        ok(dcb.BaudRate == expected[n], "COM%lu: got rate %lu instead of %lu, another COM opens the same device.\n",
+           n, dcb.BaudRate, expected[n]);
+    }
+    for (n = 1; n <= MAX_COM_PORTS; n++)
+    {
+        if (ports[n] == INVALID_HANDLE_VALUE) continue;
+        SetCommState(ports[n], &saved[n]);
+        CloseHandle(ports[n]);
+    }
+
+    /* a number that is not listed doesn't open anything */
+    for (n = 1; n <= MAX_COM_PORTS; n++)
+    {
+        if (listed[n]) continue;
+        swprintf(path, ARRAY_SIZE(path), L"\\\\.\\COM%lu", n);
+        SetLastError(0xdeadbeef);
+        hcom = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        ok(hcom == INVALID_HANDLE_VALUE, "Unlisted COM%lu opens.\n", n);
+        if (hcom != INVALID_HANDLE_VALUE) CloseHandle(hcom);
+        else ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Unlisted COM%lu: got error %lu.\n", n, GetLastError());
+    }
+}
+
 START_TEST(comm)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -2913,6 +3051,7 @@ START_TEST(comm)
     test_WaitBreak();
     test_stdio();
     test_read_write();
+    test_port_numbers();
 
     if (!winetest_interactive)
     {
