@@ -493,6 +493,7 @@ extern int primary_monitor;
 extern int copy_default_colors;
 extern int alloc_system_colors;
 extern int xrender_error_base;
+extern int xrandr_error_base;
 extern char *process_name;
 extern Display *clipboard_display;
 
@@ -635,7 +636,8 @@ enum x11drv_window_messages
     WM_X11DRV_UPDATE_CLIPBOARD = WM_WINE_FIRST_DRIVER_MSG,
     WM_X11DRV_SET_WIN_REGION,
     WM_X11DRV_DELETE_TAB,
-    WM_X11DRV_ADD_TAB
+    WM_X11DRV_ADD_TAB,
+    WM_X11DRV_DESKTOP_RESIZED
 };
 
 /* _NET_WM_STATE properties that we keep track of */
@@ -823,6 +825,13 @@ struct x11drv_settings_handler
      *
      * Return FALSE if the device cannot be found and TRUE on success */
     BOOL (*get_id)(const WCHAR *device_name, BOOL is_primary, x11drv_settings_id *id);
+
+    /* get_id_from_adapter() maps an adapter id of the display device handler to a driver specific
+     * id directly, for settings handlers that share the id space of the display device handler of
+     * the same name. Optional, get_id() is used when it is NULL.
+     *
+     * Return FALSE if the device cannot be found and TRUE on success */
+    BOOL (*get_id_from_adapter)(ULONG_PTR adapter_id, x11drv_settings_id *id);
 
     /* get_modes() will be called to get a list of supported modes of the device of id in modes
      * with respect to flags, which could be 0, EDS_RAWMODE or EDS_ROTATEDMODE. If the implementation

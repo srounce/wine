@@ -79,6 +79,7 @@ MAKE_FUNCPTR(XRRGetScreenSizeRange)
 MAKE_FUNCPTR(XRRSetCrtcConfig)
 MAKE_FUNCPTR(XRRSetScreenSize)
 MAKE_FUNCPTR(XRRSelectInput)
+MAKE_FUNCPTR(XRRUpdateConfiguration)
 MAKE_FUNCPTR(XRRGetOutputPrimary)
 MAKE_FUNCPTR(XRRGetProviderResources)
 MAKE_FUNCPTR(XRRFreeProviderResources)
@@ -124,6 +125,7 @@ static int load_xrandr(void)
         LOAD_FUNCPTR(XRRSetCrtcConfig);
         LOAD_FUNCPTR(XRRSetScreenSize);
         LOAD_FUNCPTR(XRRSelectInput);
+        LOAD_FUNCPTR(XRRUpdateConfiguration);
         LOAD_FUNCPTR(XRRGetOutputPrimary);
         LOAD_FUNCPTR(XRRGetProviderResources);
         LOAD_FUNCPTR(XRRFreeProviderResources);
@@ -395,25 +397,6 @@ static LONG xrandr10_set_current_mode( x11drv_settings_id id, const struct x11dr
 }
 
 #ifdef HAVE_XRRGETPROVIDERRESOURCES
-
-static struct current_mode
-{
-    ULONG_PTR id;
-    BOOL loaded;
-    DEVMODEW mode;
-} *current_modes;
-static int current_mode_count;
-
-static pthread_mutex_t xrandr_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void xrandr14_invalidate_current_mode_cache(void)
-{
-    pthread_mutex_lock( &xrandr_mutex );
-    free( current_modes);
-    current_modes = NULL;
-    current_mode_count = 0;
-    pthread_mutex_unlock( &xrandr_mutex );
-}
 
 static XRRScreenResources *xrandr_get_screen_resources(void)
 {
@@ -953,7 +936,12 @@ static BOOL xrandr14_get_adapters( ULONG_PTR gpu_id, struct x11drv_adapter **new
     {
         output_info = pXRRGetOutputInfo( gdi_display, screen_resources, outputs[i] );
         if (!output_info)
-            goto done;
+        {
+            /* The output went away after the screen resources were fetched, e.g. Xwayland
+             * removing it when a monitor is disabled. Treat it like a disconnected output. */
+            WARN( "Output %#lx disappeared, skipping it.\n", outputs[i] );
+            continue;
+        }
 
         /* Only connected output are considered as monitors */
         if (output_info->connection != RR_Connected)
@@ -969,10 +957,11 @@ static BOOL xrandr14_get_adapters( ULONG_PTR gpu_id, struct x11drv_adapter **new
         {
             crtc_info = pXRRGetCrtcInfo( gdi_display, screen_resources, output_info->crtc );
             if (!crtc_info)
-                goto done;
+                WARN( "CRTC %#lx of output %#lx disappeared, treating the output as detached.\n",
+                      output_info->crtc, outputs[i] );
         }
 
-        if (!output_info->crtc || !crtc_info->mode)
+        if (!output_info->crtc || !crtc_info || !crtc_info->mode)
             detached = TRUE;
 
         /* Ignore mirroring output replicas because mirrored monitors are under the same adapter */
@@ -1094,17 +1083,25 @@ static BOOL xrandr14_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
 
     output_info = pXRRGetOutputInfo( gdi_display, screen_resources, adapter_id );
     if (!output_info)
+    {
+        /* The adapter's output went away since the adapters were enumerated: no monitors. */
+        WARN( "Output %#lx disappeared, reporting no monitors for it.\n", adapter_id );
+        *new_monitors = monitors;
+        *count = 0;
+        ret = TRUE;
         goto done;
+    }
 
     if (output_info->crtc)
     {
         crtc_info = pXRRGetCrtcInfo( gdi_display, screen_resources, output_info->crtc );
         if (!crtc_info)
-            goto done;
+            WARN( "CRTC %#lx of output %#lx disappeared, treating the monitor as inactive.\n",
+                  output_info->crtc, adapter_id );
     }
 
     /* Inactive but attached monitor, no need to check for mirrored/replica monitors */
-    if (!output_info->crtc || !crtc_info->mode)
+    if (!output_info->crtc || !crtc_info || !crtc_info->mode)
     {
         monitors[monitor_count].edid_len = get_edid( adapter_id, &monitors[monitor_count].edid );
         monitor_count = 1;
@@ -1118,7 +1115,7 @@ static BOOL xrandr14_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
         {
             enum_output_info = pXRRGetOutputInfo( gdi_display, screen_resources, screen_resources->outputs[i] );
             if (!enum_output_info)
-                goto done;
+                continue; /* output disappeared, it cannot be a replica */
 
             /* Detached outputs don't count */
             if (enum_output_info->connection != RR_Connected)
@@ -1142,7 +1139,11 @@ static BOOL xrandr14_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
             {
                 enum_crtc_info = pXRRGetCrtcInfo( gdi_display, screen_resources, enum_output_info->crtc );
                 if (!enum_crtc_info)
-                    goto done;
+                {
+                    pXRRFreeOutputInfo( enum_output_info );
+                    enum_output_info = NULL;
+                    continue; /* CRTC disappeared, it cannot be a replica */
+                }
 
                 if (enum_crtc_info->x == crtc_info->x &&
                     enum_crtc_info->y == crtc_info->y &&
@@ -1221,11 +1222,15 @@ static void xrandr14_free_monitors( struct gdi_monitor *monitors, int count )
     free( monitors );
 }
 
+static int xrandr_screen_change_event;
+
 static BOOL xrandr14_device_change_handler( HWND hwnd, XEvent *event )
 {
     RECT rect;
 
-    xrandr14_invalidate_current_mode_cache();
+    /* keep Xlib's screen configuration current for RRScreenChangeNotify */
+    if (event->type == xrandr_screen_change_event) pXRRUpdateConfiguration( event );
+
     if (hwnd == NtUserGetDesktopWindow() && NtUserGetWindowThread( hwnd, NULL ) == GetCurrentThreadId())
         NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
     /* Update xinerama monitors for xinerama_get_fullscreen_monitors() */
@@ -1242,8 +1247,12 @@ static void xrandr14_register_event_handlers(void)
     if (!pXRRQueryExtension( display, &event_base, &error_base ))
         return;
 
+    /* Output removal and primary output changes are only reported through
+     * RRScreenChangeNotify, so subscribe to it as well. */
+    xrandr_screen_change_event = event_base + RRScreenChangeNotify;
     pXRRSelectInput( display, root_window,
-                     RRCrtcChangeNotifyMask | RROutputChangeNotifyMask | RRProviderChangeNotifyMask );
+                     RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask | RROutputChangeNotifyMask |
+                     RRProviderChangeNotifyMask );
     X11DRV_register_event_handler( event_base + RRNotify_CrtcChange, xrandr14_device_change_handler,
                                    "XRandR CrtcChange" );
     X11DRV_register_event_handler( event_base + RRNotify_OutputChange, xrandr14_device_change_handler,
@@ -1255,67 +1264,46 @@ static void xrandr14_register_event_handlers(void)
 /* XRandR 1.4 display settings handler */
 static BOOL xrandr14_get_id( const WCHAR *device_name, BOOL is_primary, x11drv_settings_id *id )
 {
-    struct current_mode *tmp_modes, *new_current_modes = NULL;
-    INT gpu_count, adapter_count, new_current_mode_count = 0;
-    INT gpu_idx, adapter_idx, display_idx;
+    INT gpu_count, adapter_count, adapter_base = 0;
+    INT gpu_idx, display_idx;
     struct x11drv_adapter *adapters;
     struct x11drv_gpu *gpus;
+    BOOL found = FALSE;
     WCHAR *end;
 
     /* Parse \\.\DISPLAY%d */
     display_idx = wcstol( device_name + 11, &end, 10 ) - 1;
-    if (*end)
+    if (*end || display_idx < 0)
         return FALSE;
 
-    /* Update cache */
-    pthread_mutex_lock( &xrandr_mutex );
-    if (!current_modes)
-    {
-        if (!xrandr14_get_gpus( &gpus, &gpu_count, FALSE ))
-        {
-            pthread_mutex_unlock( &xrandr_mutex );
-            return FALSE;
-        }
-
-        for (gpu_idx = 0; gpu_idx < gpu_count; ++gpu_idx)
-        {
-            if (!xrandr14_get_adapters( gpus[gpu_idx].id, &adapters, &adapter_count ))
-                break;
-
-            tmp_modes = realloc( new_current_modes, (new_current_mode_count + adapter_count) * sizeof(*tmp_modes) );
-            if (!tmp_modes)
-            {
-                xrandr14_free_adapters( adapters );
-                break;
-            }
-            new_current_modes = tmp_modes;
-
-            for (adapter_idx = 0; adapter_idx < adapter_count; ++adapter_idx)
-            {
-                new_current_modes[new_current_mode_count + adapter_idx].id = adapters[adapter_idx].id;
-                new_current_modes[new_current_mode_count + adapter_idx].loaded = FALSE;
-            }
-            new_current_mode_count += adapter_count;
-            xrandr14_free_adapters( adapters );
-        }
-        xrandr14_free_gpus( gpus, gpu_count );
-
-        if (new_current_modes)
-        {
-            free( current_modes );
-            current_modes = new_current_modes;
-            current_mode_count = new_current_mode_count;
-        }
-    }
-
-    if (display_idx >= current_mode_count)
-    {
-        pthread_mutex_unlock( &xrandr_mutex );
+    /* Resolve the index against the current host state on every call. The result used to be
+     * cached per process and only invalidated by XRandR events, which only the desktop thread
+     * receives, so any other process kept handing out ids of outputs that were long gone. */
+    if (!xrandr14_get_gpus( &gpus, &gpu_count, FALSE ))
         return FALSE;
-    }
 
-    id->id = current_modes[display_idx].id;
-    pthread_mutex_unlock( &xrandr_mutex );
+    for (gpu_idx = 0; gpu_idx < gpu_count && !found; ++gpu_idx)
+    {
+        if (!xrandr14_get_adapters( gpus[gpu_idx].id, &adapters, &adapter_count ))
+            break;
+
+        if (display_idx < adapter_base + adapter_count)
+        {
+            id->id = adapters[display_idx - adapter_base].id;
+            found = TRUE;
+        }
+        adapter_base += adapter_count;
+        xrandr14_free_adapters( adapters );
+    }
+    xrandr14_free_gpus( gpus, gpu_count );
+
+    return found;
+}
+
+/* adapters are RROutputs, which the settings functions use as id as well */
+static BOOL xrandr14_get_id_from_adapter( ULONG_PTR adapter_id, x11drv_settings_id *id )
+{
+    id->id = adapter_id;
     return TRUE;
 }
 
@@ -1452,7 +1440,6 @@ done:
 
 static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
 {
-    struct current_mode *mode_ptr = NULL;
     XRRScreenResources *screen_resources;
     XRROutputInfo *output_info = NULL;
     RROutput output = (RROutput)id.id;
@@ -1461,23 +1448,6 @@ static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
     BOOL ret = FALSE;
     RECT primary;
     INT mode_idx;
-
-    pthread_mutex_lock( &xrandr_mutex );
-    for (mode_idx = 0; mode_idx < current_mode_count; ++mode_idx)
-    {
-        if (current_modes[mode_idx].id != id.id)
-            continue;
-
-        if (!current_modes[mode_idx].loaded)
-        {
-            mode_ptr = &current_modes[mode_idx];
-            break;
-        }
-
-        memcpy( mode, &current_modes[mode_idx].mode, sizeof(*mode) );
-        pthread_mutex_unlock( &xrandr_mutex );
-        return TRUE;
-    }
 
     screen_resources = xrandr_get_screen_resources();
     if (!screen_resources)
@@ -1491,11 +1461,12 @@ static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
     {
         crtc_info = pXRRGetCrtcInfo( gdi_display, screen_resources, output_info->crtc );
         if (!crtc_info)
-            goto done;
+            WARN( "CRTC %#lx of output %#lx disappeared, treating the output as detached.\n",
+                  output_info->crtc, output );
     }
 
     /* Detached */
-    if (output_info->connection != RR_Connected || !output_info->crtc || !crtc_info->mode)
+    if (output_info->connection != RR_Connected || !output_info->crtc || !crtc_info || !crtc_info->mode)
     {
         mode->dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
                          DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY | DM_POSITION;
@@ -1539,14 +1510,6 @@ static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
     ret = TRUE;
 
 done:
-    if (ret && mode_ptr)
-    {
-        memcpy( &mode_ptr->mode, mode, sizeof(*mode) );
-        mode_ptr->mode.dmSize = sizeof(*mode);
-        mode_ptr->mode.dmDriverExtra = 0;
-        mode_ptr->loaded = TRUE;
-    }
-    pthread_mutex_unlock( &xrandr_mutex );
     if (crtc_info)
         pXRRFreeCrtcInfo( crtc_info );
     if (output_info)
@@ -1659,7 +1622,6 @@ done:
     if (output_info)
         pXRRFreeOutputInfo( output_info );
     pXRRFreeScreenResources( screen_resources );
-    xrandr14_invalidate_current_mode_cache();
     return ret;
 }
 
@@ -1668,7 +1630,7 @@ done:
 void X11DRV_XRandR_Init(void)
 {
     struct x11drv_display_device_handler display_handler;
-    struct x11drv_settings_handler settings_handler;
+    struct x11drv_settings_handler settings_handler = {0};
     int event_base, error_base, minor, ret;
     static int major;
     Bool ok;
@@ -1679,6 +1641,7 @@ void X11DRV_XRandR_Init(void)
 
     /* see if Xrandr is available */
     if (!pXRRQueryExtension( gdi_display, &event_base, &error_base )) return;
+    xrandr_error_base = error_base;
     X11DRV_expect_error( gdi_display, XRandRErrorHandler, NULL );
     ok = pXRRQueryVersion( gdi_display, &major, &minor );
     if (X11DRV_check_error() || !ok) return;
@@ -1745,6 +1708,7 @@ void X11DRV_XRandR_Init(void)
         settings_handler.name = "XRandR 1.4";
         settings_handler.priority = 300;
         settings_handler.get_id = xrandr14_get_id;
+        settings_handler.get_id_from_adapter = xrandr14_get_id_from_adapter;
         settings_handler.get_modes = xrandr14_get_modes;
         settings_handler.get_current_mode = xrandr14_get_current_mode;
         settings_handler.set_current_mode = xrandr14_set_current_mode;

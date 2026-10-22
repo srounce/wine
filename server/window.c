@@ -250,6 +250,7 @@ static struct monitor_info *get_monitor_from_rect( struct winstation *winstation
         struct rectangle intersect, target = is_raw ? monitor->raw : monitor->virt;
 
         if (monitor->flags & (MONITOR_FLAG_CLONE | MONITOR_FLAG_INACTIVE)) continue;
+        if (is_rect_empty( &target )) continue; /* no usable area to map to or from */
 
         if (intersect_rect( &intersect, &target, rect ))
         {
@@ -298,6 +299,8 @@ static void map_point_raw_to_virt( struct desktop *desktop, int *x, int *y )
     height_to = monitor->virt.bottom - monitor->virt.top;
     width_from = monitor->raw.right - monitor->raw.left;
     height_from = monitor->raw.bottom - monitor->raw.top;
+    /* a monitor without a raw area cannot be scaled from, leave the point unchanged */
+    if (width_from <= 0 || height_from <= 0) return;
 
     *x = *x * 2 - (monitor->raw.left * 2 + width_from);
     *x = (*x * width_to * 2 + width_from) / (width_from * 2);
