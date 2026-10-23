@@ -27,6 +27,8 @@
 #include "winbase.h"
 #include "winnls.h"
 #include "winreg.h"
+#include "winuser.h"
+#include "dbt.h"
 
 #define TIMEOUT 1000   /* one second for Timeouts*/
 #define SLOWBAUD 150
@@ -2881,6 +2883,65 @@ done:
 
 #define MAX_COM_PORTS 256
 
+static HKEY open_serialcomm(void)
+{
+    HKEY key;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_QUERY_VALUE | KEY_NOTIFY, &key))
+        return NULL;
+    return key;
+}
+
+static DWORD com_number(const WCHAR *name)
+{
+    WCHAR *end;
+    DWORD n;
+
+    n = wcsncmp(name, L"COM", 3) ? 0 : wcstoul(name + 3, &end, 10);
+    return n && n <= MAX_COM_PORTS && !*end ? n : 0;
+}
+
+/* the COM numbers listed in SERIALCOMM, returns how many; check = test the values too */
+static DWORD list_com_ports(HKEY key, BOOL *listed, BOOL check)
+{
+    DWORD i, n, count = 0, size, type, len;
+    WCHAR name[64], value[16];
+    LSTATUS ret;
+
+    memset(listed, 0, (MAX_COM_PORTS + 1) * sizeof(*listed));
+    for (i = 0;; i++)
+    {
+        len = ARRAY_SIZE(name);
+        size = sizeof(value) - sizeof(WCHAR);
+        memset(value, 0, sizeof(value));
+        ret = RegEnumValueW(key, i, name, &len, NULL, &type, (BYTE *)value, &size);
+        if (ret == ERROR_NO_MORE_ITEMS) break;
+        if (check) ok(!ret, "RegEnumValueW returned %ld.\n", ret);
+        if (ret) break;
+        if (check) ok(type == REG_SZ, "%s: got type %lu.\n", wine_dbgstr_w(name), type);
+        if (!(n = com_number(value)))
+        {
+            if (check) trace("%s: skipping port %s.\n", wine_dbgstr_w(name), wine_dbgstr_w(value));
+            continue;
+        }
+        if (check) ok(!listed[n], "COM%lu is listed twice.\n", n);
+        listed[n] = TRUE;
+        count++;
+    }
+    return count;
+}
+
+static BOOL comdb_claims(DWORD n)
+{
+    static BYTE comdb[4096 / 8];
+    DWORD size = sizeof(comdb);
+
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\COM Name Arbiter",
+                     L"ComDB", RRF_RT_REG_BINARY, NULL, comdb, &size))
+        return FALSE;
+    return n <= size * 8 && (comdb[(n - 1) / 8] & (1 << ((n - 1) % 8)));
+}
+
 static void test_port_numbers(void)
 {
     /* a distinct rate for each open port; 1200 is left out, it resets some boards */
@@ -2890,40 +2951,21 @@ static void test_port_numbers(void)
     static DWORD expected[MAX_COM_PORTS + 1];
     static BOOL usable[MAX_COM_PORTS + 1];
     static BYTE comdb[4096 / 8];
-    BOOL listed[MAX_COM_PORTS + 1] = { 0 };
-    DWORD i, n, count = 0, size, type, len;
-    WCHAR name[64], value[16], path[16], *end;
+    BOOL listed[MAX_COM_PORTS + 1];
+    DWORD i, n, count, size;
+    WCHAR path[16];
     HANDLE hcom;
     LSTATUS ret;
     BOOL res;
     HKEY key;
     DCB dcb;
 
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_QUERY_VALUE, &key))
+    if (!(key = open_serialcomm()))
     {
         skip("No SERIALCOMM key.\n");
         return;
     }
-    for (i = 0;; i++)
-    {
-        len = ARRAY_SIZE(name);
-        size = sizeof(value) - sizeof(WCHAR);
-        memset(value, 0, sizeof(value));
-        ret = RegEnumValueW(key, i, name, &len, NULL, &type, (BYTE *)value, &size);
-        if (ret == ERROR_NO_MORE_ITEMS) break;
-        ok(!ret, "RegEnumValueW returned %ld.\n", ret);
-        if (ret) break;
-        ok(type == REG_SZ, "%s: got type %lu.\n", wine_dbgstr_w(name), type);
-        n = wcsncmp(value, L"COM", 3) ? 0 : wcstoul(value + 3, &end, 10);
-        if (!n || n > MAX_COM_PORTS || *end)
-        {
-            trace("%s: skipping port %s.\n", wine_dbgstr_w(name), wine_dbgstr_w(value));
-            continue;
-        }
-        ok(!listed[n], "COM%lu is listed twice.\n", n);
-        listed[n] = TRUE;
-        count++;
-    }
+    count = list_com_ports(key, listed, TRUE);
     RegCloseKey(key);
     if (!count)
     {
@@ -3016,6 +3058,308 @@ static void test_port_numbers(void)
     }
 }
 
+#define HOTPLUG_TIMEOUT 30000
+
+static struct
+{
+    DWORD nodes_changed;    /* DBT_DEVNODES_CHANGED messages */
+    BOOL nodes_listed[MAX_COM_PORTS + 1]; /* SERIALCOMM when the last one came */
+    DWORD arrival, removal; /* port of the last DBT_DEVTYP_PORT message of each kind */
+    BOOL arrival_listed, removal_listed; /* SERIALCOMM listed it when the message came */
+} hotplug;
+
+static LRESULT CALLBACK hotplug_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    const DEV_BROADCAST_PORT_W *port = (const DEV_BROADCAST_PORT_W *)lparam;
+    BOOL listed[MAX_COM_PORTS + 1];
+    HKEY key;
+    DWORD n;
+
+    if (msg != WM_DEVICECHANGE) return DefWindowProcW(hwnd, msg, wparam, lparam);
+    if (wparam == DBT_DEVNODES_CHANGED && (key = open_serialcomm()))
+    {
+        trace("DBT_DEVNODES_CHANGED.\n");
+        hotplug.nodes_changed++;
+        list_com_ports(key, hotplug.nodes_listed, FALSE);
+        RegCloseKey(key);
+    }
+    if ((wparam != DBT_DEVICEARRIVAL && wparam != DBT_DEVICEREMOVECOMPLETE) || !port ||
+        port->dbcp_devicetype != DBT_DEVTYP_PORT)
+        return TRUE;
+    trace("%s for %s.\n", wparam == DBT_DEVICEARRIVAL ? "DBT_DEVICEARRIVAL" : "DBT_DEVICEREMOVECOMPLETE",
+          wine_dbgstr_w(port->dbcp_name));
+    if (!(n = com_number(port->dbcp_name)) || !(key = open_serialcomm())) return TRUE;
+    list_com_ports(key, listed, FALSE);
+    RegCloseKey(key);
+    if (wparam == DBT_DEVICEARRIVAL)
+    {
+        hotplug.arrival = n;
+        hotplug.arrival_listed = listed[n];
+    }
+    else
+    {
+        hotplug.removal = n;
+        hotplug.removal_listed = listed[n];
+    }
+    return TRUE;
+}
+
+static void pump_messages(void)
+{
+    MSG msg;
+
+    while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+}
+
+static void notify_serialcomm(HKEY key, HANDLE event)
+{
+    LSTATUS ret;
+
+    ResetEvent(event);
+    ret = RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, event, TRUE);
+    ok(!ret, "RegNotifyChangeKeyValue returned %ld.\n", ret);
+}
+
+/* waits until a port is added to (> 0) or removed from (< 0) SERIALCOMM, 0 on timeout;
+ * notified = a change notification came less than a second before the change was seen, or after it */
+static int wait_port_change(HKEY key, HANDLE event, BOOL *listed, DWORD *last_notify, BOOL *notified)
+{
+    DWORD start = GetTickCount(), n, i, changed, seen;
+    BOOL now[MAX_COM_PORTS + 1];
+
+    *notified = FALSE;
+    while (GetTickCount() - start < HOTPLUG_TIMEOUT)
+    {
+        if (!MsgWaitForMultipleObjects(1, &event, FALSE, 20, QS_ALLINPUT))
+        {
+            *last_notify = GetTickCount();
+            notify_serialcomm(key, event);
+        }
+        pump_messages();
+        list_com_ports(key, now, FALSE);
+        for (n = 1; n <= MAX_COM_PORTS; n++)
+        {
+            if (now[n] == listed[n]) continue;
+            for (i = n, changed = 0; i <= MAX_COM_PORTS; i++) changed += now[i] != listed[i];
+            ok(changed == 1, "%lu ports changed at once.\n", changed);
+            list_com_ports(key, now, TRUE);
+            memcpy(listed, now, sizeof(now));
+            seen = GetTickCount();
+            if (seen - *last_notify > 1000 && !WaitForSingleObject(event, 1000))
+            {
+                *last_notify = GetTickCount();
+                notify_serialcomm(key, event);
+            }
+            *notified = (int)(*last_notify - seen) >= -1000;
+            return now[n] ? n : -(int)n;
+        }
+    }
+    return 0;
+}
+
+static void wait_messages(DWORD timeout)
+{
+    DWORD start = GetTickCount();
+
+    while (GetTickCount() - start < timeout)
+    {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 20, QS_ALLINPUT);
+        pump_messages();
+    }
+}
+
+/* pumps messages until the DBT_DEVTYP_PORT message for the port came, and a DBT_DEVNODES_CHANGED
+ * after SERIALCOMM changed */
+static void wait_port_messages(DWORD *port, DWORD n, BOOL listed)
+{
+    DWORD start = GetTickCount();
+
+    while (GetTickCount() - start < 5000 && (*port != n || hotplug.nodes_listed[n] != listed))
+    {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 20, QS_ALLINPUT);
+        pump_messages();
+    }
+}
+
+static void test_port_hotplug(void)
+{
+    WNDCLASSW class = { .lpfnWndProc = hotplug_wndproc, .lpszClassName = L"comm_hotplug" };
+    BOOL listed[MAX_COM_PORTS + 1], notified;
+    DWORD i, n, removed = 0, last_notify;
+    WCHAR path[16];
+    HANDLE event, hcom;
+    HWND hwnd;
+    HKEY key;
+    DCB dcb;
+    int change;
+
+    if (!(key = open_serialcomm()))
+    {
+        skip("No SERIALCOMM key.\n");
+        return;
+    }
+    event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    class.hInstance = GetModuleHandleW(NULL);
+    RegisterClassW(&class);
+    /* WM_DEVICECHANGE is broadcast to the top-level windows */
+    hwnd = CreateWindowExW(0, class.lpszClassName, NULL, 0, 0, 0, 0, 0, NULL, NULL, class.hInstance, NULL);
+    ok(hwnd != NULL, "CreateWindowExW failed, error %lu.\n", GetLastError());
+    list_com_ports(key, listed, TRUE);
+    /* let the messages sent before the window existed go by */
+    wait_messages(1000);
+    notify_serialcomm(key, event);
+    last_notify = GetTickCount() - 10000;
+
+    trace("Unplug a USB serial port and plug it back, or plug one in and unplug it, within %u seconds.\n",
+          HOTPLUG_TIMEOUT / 1000);
+    for (i = 0; i < 2; i++)
+    {
+        hotplug.nodes_changed = hotplug.arrival = hotplug.removal = 0;
+        memcpy(hotplug.nodes_listed, listed, sizeof(listed));
+        change = wait_port_change(key, event, listed, &last_notify, &notified);
+        ok(change, "No COM port was added or removed in %u seconds.\n", HOTPLUG_TIMEOUT / 1000);
+        if (!change)
+        {
+            ok(hotplug.nodes_changed, "Got no DBT_DEVNODES_CHANGED.\n");
+            ok(!hotplug.arrival && !hotplug.removal, "Got a port message without a SERIALCOMM change.\n");
+            continue;
+        }
+
+        n = abs(change);
+        swprintf(path, ARRAY_SIZE(path), L"\\\\.\\COM%lu", n);
+        if (change > 0)
+        {
+            trace("COM%lu was added.\n", n);
+            ok(notified, "COM%lu was added without a SERIALCOMM change notification.\n", n);
+            wait_port_messages(&hotplug.arrival, n, TRUE);
+            ok(hotplug.arrival == n, "Got no DBT_DEVICEARRIVAL for COM%lu.\n", n);
+            if (hotplug.arrival == n)
+                ok(hotplug.arrival_listed, "DBT_DEVICEARRIVAL for COM%lu came before SERIALCOMM listed it.\n", n);
+            ok(hotplug.nodes_listed[n], "Got no DBT_DEVNODES_CHANGED after COM%lu was listed.\n", n);
+            ok(comdb_claims(n), "COM%lu is not claimed in ComDB.\n", n);
+            if (removed)
+                ok(n == removed, "The port came back as COM%lu instead of COM%lu.\n", n, removed);
+
+            hcom = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+            ok(hcom != INVALID_HANDLE_VALUE, "Can't open added COM%lu, error %lu.\n", n, GetLastError());
+            if (hcom == INVALID_HANDLE_VALUE) continue;
+            ok(GetCommState(hcom, &dcb), "Added COM%lu is not a serial port, error %lu.\n", n, GetLastError());
+            CloseHandle(hcom);
+        }
+        else
+        {
+            trace("COM%lu was removed.\n", n);
+            removed = n;
+            ok(notified, "COM%lu was removed without a SERIALCOMM change notification.\n", n);
+            wait_port_messages(&hotplug.removal, n, FALSE);
+            ok(hotplug.removal == n, "Got no DBT_DEVICEREMOVECOMPLETE for COM%lu.\n", n);
+            if (hotplug.removal == n)
+                ok(!hotplug.removal_listed, "DBT_DEVICEREMOVECOMPLETE for COM%lu came while SERIALCOMM listed it.\n", n);
+            ok(hotplug.nodes_changed && !hotplug.nodes_listed[n],
+               "Got no DBT_DEVNODES_CHANGED after COM%lu was unlisted.\n", n);
+            /* the number stays reserved for the device */
+            ok(comdb_claims(n), "COM%lu is no longer claimed in ComDB.\n", n);
+
+            SetLastError(0xdeadbeef);
+            hcom = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+            ok(hcom == INVALID_HANDLE_VALUE, "Removed COM%lu opens.\n", n);
+            if (hcom != INVALID_HANDLE_VALUE) CloseHandle(hcom);
+            else ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Removed COM%lu: got error %lu.\n", n, GetLastError());
+        }
+    }
+
+    DestroyWindow(hwnd);
+    UnregisterClassW(class.lpszClassName, class.hInstance);
+    CloseHandle(event);
+    RegCloseKey(key);
+}
+
+#define BUSY_WINDOWS 5
+
+/* like the window of a thread that is busy, e.g. waiting for a port to show up, when the port message comes */
+static LRESULT CALLBACK busy_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    if (msg == WM_DEVICECHANGE && (wparam == DBT_DEVICEARRIVAL || wparam == DBT_DEVICEREMOVECOMPLETE))
+        Sleep(3000);
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static DWORD CALLBACK busy_window_thread(void *ready)
+{
+    HWND hwnd;
+    MSG msg;
+
+    hwnd = CreateWindowExW(0, L"comm_hotplug_busy", NULL, 0, 0, 0, 0, 0, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    ok(hwnd != NULL, "CreateWindowExW failed, error %lu.\n", GetLastError());
+    SetEvent(ready);
+    while (GetMessageW(&msg, 0, 0, 0)) DispatchMessageW(&msg);
+    DestroyWindow(hwnd);
+    return 0;
+}
+
+/* SERIALCOMM follows the devices while windows are slow to answer the port messages */
+static void test_port_hotplug_busy(void)
+{
+    WNDCLASSW class = { .lpfnWndProc = hotplug_wndproc, .lpszClassName = L"comm_hotplug" };
+    WNDCLASSW busy_class = { .lpfnWndProc = busy_wndproc, .lpszClassName = L"comm_hotplug_busy" };
+    BOOL listed[MAX_COM_PORTS + 1], now[MAX_COM_PORTS + 1];
+    DWORD i, n, start, count = 0, seen[2], tids[BUSY_WINDOWS];
+    HANDLE threads[BUSY_WINDOWS], ready;
+    HWND hwnd;
+    HKEY key;
+
+    if (!(key = open_serialcomm()))
+    {
+        skip("No SERIALCOMM key.\n");
+        return;
+    }
+    class.hInstance = busy_class.hInstance = GetModuleHandleW(NULL);
+    RegisterClassW(&class);
+    RegisterClassW(&busy_class);
+    /* this window comes after the busy ones in the z-order */
+    hwnd = CreateWindowExW(0, class.lpszClassName, NULL, 0, 0, 0, 0, 0, NULL, NULL, class.hInstance, NULL);
+    ok(hwnd != NULL, "CreateWindowExW failed, error %lu.\n", GetLastError());
+    ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+    for (i = 0; i < BUSY_WINDOWS; i++)
+    {
+        threads[i] = CreateThread(NULL, 0, busy_window_thread, ready, 0, &tids[i]);
+        WaitForSingleObject(ready, 5000);
+    }
+    list_com_ports(key, listed, TRUE);
+    wait_messages(1000);
+
+    trace("Unplug a USB serial port and plug it back within 5 seconds.\n");
+    start = GetTickCount();
+    while (count < 2 && GetTickCount() - start < HOTPLUG_TIMEOUT)
+    {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 20, QS_ALLINPUT);
+        pump_messages();
+        list_com_ports(key, now, FALSE);
+        for (n = 1; n <= MAX_COM_PORTS; n++)
+        {
+            if (now[n] == listed[n]) continue;
+            seen[count++] = GetTickCount();
+            trace("COM%lu was %s.\n", n, now[n] ? "added" : "removed");
+            break;
+        }
+        memcpy(listed, now, sizeof(now));
+    }
+    ok(count == 2, "Got %lu COM port changes in %u seconds.\n", count, HOTPLUG_TIMEOUT / 1000);
+    if (count == 2)
+        ok(seen[1] - seen[0] < 8000, "SERIALCOMM changed %lu ms after the previous change.\n", seen[1] - seen[0]);
+    /* the port messages that are still on their way */
+    wait_messages(5000);
+
+    for (i = 0; i < BUSY_WINDOWS; i++) PostThreadMessageW(tids[i], WM_QUIT, 0, 0);
+    WaitForMultipleObjects(BUSY_WINDOWS, threads, TRUE, 10000);
+    for (i = 0; i < BUSY_WINDOWS; i++) CloseHandle(threads[i]);
+    CloseHandle(ready);
+    DestroyWindow(hwnd);
+    UnregisterClassW(busy_class.lpszClassName, busy_class.hInstance);
+    UnregisterClassW(class.lpszClassName, class.hInstance);
+    RegCloseKey(key);
+}
+
 START_TEST(comm)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -3060,4 +3404,6 @@ START_TEST(comm)
     }
 
     test_WaitCommEvent();
+    test_port_hotplug();
+    test_port_hotplug_busy();
 }
