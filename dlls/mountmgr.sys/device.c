@@ -2801,6 +2801,14 @@ DWORD WINAPI port_watch_thread( void *arg )
     return 0;
 }
 
+/* a port is opened through its dosdevices symlink, so this is only reached when its device is gone */
+static NTSTATUS WINAPI serial_create( DEVICE_OBJECT *device, IRP *irp )
+{
+    irp->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 /* driver entry point for the serial port driver */
 NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 {
@@ -2808,7 +2816,7 @@ NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path
     struct detect_ports_params params = { devices, sizeof(devices) };
 
     serial_driver = driver;
-    /* TODO: fill in driver->MajorFunction */
+    driver->MajorFunction[IRP_MJ_CREATE] = serial_create;
 
     MOUNTMGR_CALL( detect_serial_ports, &params );
     create_port_devices( driver, devices );
