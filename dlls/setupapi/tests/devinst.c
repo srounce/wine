@@ -1774,6 +1774,110 @@ static void test_register_device_info(void)
     SetupDiDestroyDeviceInfoList(set);
 }
 
+static BOOL device_id_listed(const WCHAR *instance_id, ULONG flags)
+{
+    WCHAR *buffer, *id;
+    BOOL found = FALSE;
+    ULONG size = 0;
+    CONFIGRET cr;
+
+    flags |= CM_GETIDLIST_FILTER_ENUMERATOR;
+    do
+    {
+        /* The list may grow between the two calls. */
+        cr = CM_Get_Device_ID_List_SizeW(&size, L"Root", flags);
+        ok(!cr, "Got unexpected error %#lx.\n", cr);
+        buffer = malloc(size * sizeof(*buffer));
+        cr = CM_Get_Device_ID_ListW(L"Root", buffer, size, flags);
+        if (cr == CR_BUFFER_SMALL) free(buffer);
+    } while (cr == CR_BUFFER_SMALL);
+    ok(!cr, "Got unexpected error %#lx.\n", cr);
+    for (id = buffer; !cr && *id; id += wcslen(id) + 1)
+        if (!wcsicmp(id, instance_id)) found = TRUE;
+    free(buffer);
+    return found;
+}
+
+static BOOL class_device_listed(const char *instance_id, DWORD flags)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    char id[MAX_DEVICE_ID_LEN];
+    BOOL found = FALSE;
+    HDEVINFO set;
+    DWORD i;
+
+    set = SetupDiGetClassDevsA(&guid, NULL, NULL, flags);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    for (i = 0; SetupDiEnumDeviceInfo(set, i, &device); ++i)
+    {
+        SetupDiGetDeviceInstanceIdA(set, &device, id, sizeof(id), NULL);
+        if (!strcasecmp(id, instance_id)) found = TRUE;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
+static void test_device_presence(void)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    DEVPROP_BOOLEAN is_present;
+    DEVPROPTYPE type;
+    BOOL listed, ret;
+    HDEVINFO set;
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+
+    /* A device which is created but not registered is a phantom. */
+    ret = SetupDiCreateDeviceInfoA(set, "Root\\LEGACY_BOGUS\\0000", &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(listed, "Device is not listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(!listed, "Phantom device is present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", 0);
+    ok(!listed, "Phantom device is listed.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(!listed, "Phantom device is present.\n");
+    is_present = 0xcc;
+    type = 0xdeadbeef;
+    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_IsPresent, &type, (BYTE *)&is_present,
+            sizeof(is_present), NULL, 0);
+    ok(ret, "Failed to get DEVPKEY_Device_IsPresent, error %#lx.\n", GetLastError());
+    ok(type == DEVPROP_TYPE_BOOLEAN, "Got type %#lx.\n", type);
+    ok(is_present == DEVPROP_FALSE, "Got IsPresent %#x.\n", is_present);
+
+    /* A registered root-enumerated device is present, even without a driver. */
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(listed, "Device is not listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(listed, "Device is not present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", 0);
+    ok(listed, "Device is not listed.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(listed, "Device is not present.\n");
+    is_present = 0xcc;
+    type = 0xdeadbeef;
+    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_IsPresent, &type, (BYTE *)&is_present,
+            sizeof(is_present), NULL, 0);
+    ok(ret, "Failed to get DEVPKEY_Device_IsPresent, error %#lx.\n", GetLastError());
+    ok(type == DEVPROP_TYPE_BOOLEAN, "Got type %#lx.\n", type);
+    ok(is_present == DEVPROP_TRUE, "Got IsPresent %#x.\n", is_present);
+
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(!listed, "Removed device is listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(!listed, "Removed device is present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(!listed, "Removed device is present.\n");
+
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 static void check_all_lower_case(int line, const char* str)
 {
     const char *cur;
@@ -5653,6 +5757,7 @@ START_TEST(devinst)
     test_get_device_instance_id();
     test_open_device_info();
     test_register_device_info();
+    test_device_presence();
     test_device_iface();
     test_device_iface_detail();
     test_device_key();
