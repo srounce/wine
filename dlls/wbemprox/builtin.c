@@ -380,6 +380,7 @@ static const struct column col_pnpentity[] =
 {
     { L"Caption",              CIM_STRING|COL_FLAG_DYNAMIC },
     { L"ClassGuid",            CIM_STRING|COL_FLAG_DYNAMIC },
+    { L"Description",          CIM_STRING|COL_FLAG_DYNAMIC },
     { L"DeviceId",             CIM_STRING|COL_FLAG_DYNAMIC },
     { L"Manufacturer",         CIM_STRING },
     { L"Name",                 CIM_STRING|COL_FLAG_DYNAMIC },
@@ -962,6 +963,7 @@ struct record_pnpentity
 {
     const WCHAR *caption;
     const WCHAR *class_guid;
+    const WCHAR *description;
     const WCHAR *device_id;
     const WCHAR *manufacturer;
     const WCHAR *name;
@@ -3654,11 +3656,14 @@ static struct record_pnpentity *get_pnp_entities( UINT *count )
                             free( device_id );
                         else
                         {
-                            ret[i].caption = get_reg_value( key_instance, L"DeviceDesc" );
+                            /* like on Windows, the name is the friendly name, or the description */
+                            if (!(ret[i].caption = get_reg_value( key_instance, L"FriendlyName" )))
+                                ret[i].caption = get_reg_value( key_instance, L"DeviceDesc" );
                             ret[i].class_guid = wcslwr( get_reg_value( key_instance, L"ClassGUID" ) );
+                            ret[i].description = get_reg_value( key_instance, L"DeviceDesc" );
                             ret[i].device_id = wcsupr( device_id );
                             ret[i].manufacturer = L"The Wine Project";
-                            ret[i].name = get_reg_value( key_instance, L"DeviceDesc" );
+                            ret[i].name = ret[i].caption ? wcsdup( ret[i].caption ) : NULL;
                             ret[i].service = get_reg_value( key_instance, L"Service" );
                             RegCloseKey( key_instance );
                             if (++i >= nb_allocated)
@@ -3671,6 +3676,7 @@ static struct record_pnpentity *get_pnp_entities( UINT *count )
                                     {
                                         free( (void *)ret[i].caption );
                                         free( (void *)ret[i].class_guid );
+                                        free( (void *)ret[i].description );
                                         free( (void *)ret[i].device_id );
                                         free( (void *)ret[i].name );
                                         free( (void *)ret[i].service );
@@ -3719,6 +3725,7 @@ static enum fill_status fill_pnpentity( struct table *table, const struct expr *
         rec = (struct record_pnpentity *)(table->data + offset);
         rec->caption      = entities[i].caption;
         rec->class_guid   = entities[i].class_guid;
+        rec->description  = entities[i].description;
         rec->device_id    = entities[i].device_id;
         rec->manufacturer = entities[i].manufacturer;
         rec->name         = entities[i].name;
