@@ -1276,7 +1276,7 @@ static void test_device_property(void)
     ok(err == NO_ERROR, "Expect last error %#x, got %#lx\n", NO_ERROR, err);
     ok(type == DEVPROP_TYPE_GUID, "Expect type %#x, got %#lx\n", DEVPROP_TYPE_GUID, type);
     ok(size == sizeof(guid_val), "Got size %lu\n", size);
-    ok(IsEqualGUID(&guid_val, &guid), "Expect buffer %s, got %s\n", debugstr_guid(&guid), debugstr_guid(&guid_val));
+    ok(IsEqualGUID(&guid_val, &guid), "Expect buffer %s, got %s\n", wine_dbgstr_guid(&guid), wine_dbgstr_guid(&guid_val));
 
     for (i = 0; i < ARRAY_SIZE(inbuilt_props); i++)
     {
@@ -3410,7 +3410,7 @@ static void test_device_interface_properties(void)
     ok(ret, "SetupDiGetDeviceInterfacePropertyW failed: %lu\n", GetLastError());
     ok(type == DEVPROP_TYPE_GUID, "%#lx != %#x\n", type, DEVPROP_TYPE_GUID);
     ok(req == sizeof(guid), "%lu != %lu\n", req, (DWORD)sizeof(guid));
-    ok(IsEqualGUID(&guid_val, &guid), "%s != %s", debugstr_guid( &guid_val ), debugstr_guid( &guid ));
+    ok(IsEqualGUID(&guid_val, &guid), "%s != %s", wine_dbgstr_guid( &guid_val ), wine_dbgstr_guid( &guid ));
 
     type = DEVPROP_TYPE_EMPTY;
     req = 0;
@@ -4720,7 +4720,7 @@ static void test_SetupDiOpenDeviceInterface(void)
     ret = SetupDiOpenDeviceInterfaceW(set, device_path, 0, &iface);
     ok(ret, "got error %lu.\n", GetLastError());
     ok(IsEqualGUID(&iface.InterfaceClassGuid, &GUID_DEVINTERFACE_DISPLAY_ADAPTER), "got %s.\n",
-            debugstr_guid(&iface.InterfaceClassGuid));
+            wine_dbgstr_guid(&iface.InterfaceClassGuid));
     memset(&iface, 0xcc, sizeof(iface));
     iface.cbSize = sizeof(iface);
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISPLAY_ADAPTER, 0, &iface);
@@ -4735,7 +4735,7 @@ static void test_SetupDiOpenDeviceInterface(void)
     ret = SetupDiOpenDeviceInterfaceA(set, device_patha, 0, &iface);
     ok(ret, "got error %lu.\n", GetLastError());
     ok(IsEqualGUID(&iface.InterfaceClassGuid, &GUID_DEVINTERFACE_DISPLAY_ADAPTER), "got %s.\n",
-            debugstr_guid(&iface.InterfaceClassGuid));
+            wine_dbgstr_guid(&iface.InterfaceClassGuid));
     memset(&iface, 0xcc, sizeof(iface));
     iface.cbSize = sizeof(iface);
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISPLAY_ADAPTER, 0, &iface);
@@ -5725,6 +5725,112 @@ static void test_class_device_order(void)
     ok(ret, "Failed to destroy device list, error %#lx.\n", GetLastError());
 }
 
+static BOOL class_guids_contain(const GUID *guids, DWORD count, const GUID *class)
+{
+    while (count--) if (IsEqualGUID(guids + count, class)) return TRUE;
+    return FALSE;
+}
+
+static void check_class_guids_(int line, const WCHAR *name, const GUID *class, BOOL expect)
+{
+    char nameA[MAX_PATH];
+    GUID guids[16];
+    DWORD count;
+    BOOL ret;
+
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameW(name, guids, ARRAY_SIZE(guids), &count);
+    ok_(__FILE__, line)(ret, "%s: got error %#lx.\n", debugstr_w(name), GetLastError());
+    ok_(__FILE__, line)(count <= ARRAY_SIZE(guids), "%s: got %lu GUIDs.\n", debugstr_w(name), count);
+    ok_(__FILE__, line)(class_guids_contain(guids, ret ? min(count, ARRAY_SIZE(guids)) : 0, class) == expect,
+            "%s: class %s %s.\n", debugstr_w(name), wine_dbgstr_guid(class), expect ? "not found" : "found");
+
+    WideCharToMultiByte(CP_ACP, 0, name, -1, nameA, sizeof(nameA), NULL, NULL);
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameA(nameA, guids, ARRAY_SIZE(guids), &count);
+    ok_(__FILE__, line)(ret, "%s: got error %#lx.\n", debugstr_a(nameA), GetLastError());
+    ok_(__FILE__, line)(class_guids_contain(guids, ret ? min(count, ARRAY_SIZE(guids)) : 0, class) == expect,
+            "%s: class %s %s.\n", debugstr_a(nameA), wine_dbgstr_guid(class), expect ? "not found" : "found");
+}
+#define check_class_guids(a,b,c) check_class_guids_(__LINE__,a,b,c)
+
+static void test_class_guids_from_name(void)
+{
+    static const GUID named_class = {0x00000001, 0x3f65, 0x11db, {0xb7,0x04,0x00,0x11,0x95,0x5c,0x2b,0xdb}};
+    static const WCHAR unnamed_key[] = L"System\\CurrentControlSet\\Control\\Class\\{00000000-3f65-11db-b704-0011955c2bdb}";
+    static const WCHAR named_key[] = L"System\\CurrentControlSet\\Control\\Class\\{00000001-3f65-11db-b704-0011955c2bdb}";
+    static const char inf_data[] =
+            "[Version]\n"
+            "Signature=\"$Chicago$\"\n"
+            "Class=WineTestNamedClass\n"
+            "ClassGUID={00000001-3f65-11db-b704-0011955c2bdb}\n"
+            "[ClassInstall32]\n"
+            "AddReg=NamedClass.NT.AddReg\n"
+            "[NamedClass.NT.AddReg]\n"
+            "HKR,,,,\"Wine test named class\"\n";
+    WCHAR buffer[MAX_PATH];
+    char tmpfile[MAX_PATH];
+    GUID guids[16];
+    DWORD count;
+    LSTATUS res;
+    HKEY key;
+    BOOL ret;
+
+    /* the class name is the Class value of the class key, not its description */
+    check_class_guids(L"Ports", &GUID_DEVCLASS_PORTS, TRUE);
+    check_class_guids(L"ports", &GUID_DEVCLASS_PORTS, TRUE);
+    check_class_guids(L"Modem", &GUID_DEVCLASS_MODEM, TRUE);
+    ret = SetupDiGetClassDescriptionW(&GUID_DEVCLASS_PORTS, buffer, ARRAY_SIZE(buffer), NULL);
+    ok(ret, "Failed to get class description, error %#lx.\n", GetLastError());
+    if (ret && wcsicmp(buffer, L"Ports")) check_class_guids(buffer, &GUID_DEVCLASS_PORTS, FALSE);
+
+    count = 0xdeadbeef;
+    ret = SetupDiClassGuidsFromNameW(L"WineNoSuchClass", guids, ARRAY_SIZE(guids), &count);
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(!count, "Got %lu GUIDs.\n", count);
+
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameW(L"Ports", NULL, 0, &count);
+    ok(!ret, "Expected failure.\n");
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "Got unexpected error %#lx.\n", GetLastError());
+    ok(count >= 1 && count != 0xdeadbeef, "Got %lu GUIDs.\n", count);
+
+    tmpfile[0] = '.';
+    tmpfile[1] = '\\';
+    get_temp_filename(tmpfile + 2);
+    create_file(tmpfile + 2, inf_data);
+    ret = SetupDiInstallClassA(NULL, tmpfile, 0, NULL);
+    DeleteFileA(tmpfile + 2);
+    if (!ret && GetLastError() == ERROR_ACCESS_DENIED)
+    {
+        skip("Not enough rights to install a class.\n");
+        return;
+    }
+    ok(ret, "Failed to install class, error %#lx.\n", GetLastError());
+
+    count = 0xdeadbeef;
+    ret = SetupDiClassGuidsFromNameW(L"WineTestNamedClass", guids, ARRAY_SIZE(guids), &count);
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(count == 1, "Got %lu GUIDs.\n", count);
+    if (count == 1) ok(IsEqualGUID(guids, &named_class), "Got class %s.\n", wine_dbgstr_guid(guids));
+    check_class_guids(L"Wine test named class", &named_class, FALSE);
+
+    /* a class whose name can't be read, enumerated first, doesn't end the search */
+    res = RegCreateKeyExW(HKEY_LOCAL_MACHINE, unnamed_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    ok(!res, "Failed to create class key, error %lu.\n", res);
+    RegCloseKey(key);
+    check_class_guids(L"WineTestNamedClass", &named_class, TRUE);
+    check_class_guids(L"Ports", &GUID_DEVCLASS_PORTS, TRUE);
+    res = RegDeleteKeyW(HKEY_LOCAL_MACHINE, unnamed_key);
+    ok(!res, "Failed to delete class key, error %lu.\n", res);
+
+    res = RegDeleteKeyW(HKEY_LOCAL_MACHINE, named_key);
+    ok(!res, "Failed to delete class key, error %lu.\n", res);
+}
+
 START_TEST(devinst)
 {
     static BOOL (WINAPI *pIsWow64Process)(HANDLE, BOOL *);
@@ -5752,6 +5858,7 @@ START_TEST(devinst)
     test_create_device_list_ex();
     test_open_class_key();
     test_install_class();
+    test_class_guids_from_name();
     test_device_info();
     test_device_property();
     test_get_device_instance_id();
