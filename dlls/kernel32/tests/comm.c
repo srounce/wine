@@ -29,6 +29,7 @@
 #include "winreg.h"
 #include "winuser.h"
 #include "dbt.h"
+#include "setupapi.h"
 
 #define TIMEOUT 1000   /* one second for Timeouts*/
 #define SLOWBAUD 150
@@ -3360,6 +3361,301 @@ static void test_port_hotplug_busy(void)
     RegCloseKey(key);
 }
 
+/* GUID_DEVCLASS_PORTS, GUID_DEVINTERFACE_COMPORT, DEVPKEY_NAME */
+static const GUID ports_class = {0x4d36e978, 0xe325, 0x11ce, {0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18}};
+static const GUID comport_iface = {0x86e0d1e0, 0x8089, 0x11d0, {0x9c,0xe4,0x08,0x00,0x3e,0x30,0x1f,0x73}};
+static const DEVPROPKEY name_key = {{0xb725f130, 0x47ef, 0x101a, {0xa5,0xf1,0x02,0x60,0x8c,0x9e,0xeb,0xac}}, 10};
+static const DEVPROPKEY driver_version_key = {{0xa8b865dd, 0x2e3d, 0x4094, {0xad,0x97,0xe5,0x93,0xa7,0x0c,0x75,0xd6}}, 3};
+static const DEVPROPKEY driver_inf_key = {{0xa8b865dd, 0x2e3d, 0x4094, {0xad,0x97,0xe5,0x93,0xa7,0x0c,0x75,0xd6}}, 5};
+static const DEVPROPKEY driver_provider_key = {{0xa8b865dd, 0x2e3d, 0x4094, {0xad,0x97,0xe5,0x93,0xa7,0x0c,0x75,0xd6}}, 9};
+
+static struct
+{
+    DWORD seq;                            /* WM_DEVICECHANGE messages seen */
+    DWORD iface_arrival, iface_removal;   /* sequence of the last COM port interface message of each kind */
+    DWORD port_arrival, port_removal;     /* sequence of the last DBT_DEVTYP_PORT message of each kind */
+    DWORD port_arrival_n, port_removal_n; /* and its port */
+    BOOL iface_arrival_listed[MAX_COM_PORTS + 1], iface_removal_listed[MAX_COM_PORTS + 1]; /* SERIALCOMM then */
+    WCHAR iface_arrival_name[MAX_PATH], iface_removal_name[MAX_PATH];
+} port_device;
+
+static LRESULT CALLBACK port_device_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    const DEV_BROADCAST_HDR *hdr = (const DEV_BROADCAST_HDR *)lparam;
+    BOOL arrival = wparam == DBT_DEVICEARRIVAL;
+    HKEY key;
+    DWORD n;
+
+    if (msg != WM_DEVICECHANGE) return DefWindowProcW(hwnd, msg, wparam, lparam);
+    if ((wparam != DBT_DEVICEARRIVAL && wparam != DBT_DEVICEREMOVECOMPLETE) || !hdr) return TRUE;
+    if (hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
+    {
+        const DEV_BROADCAST_DEVICEINTERFACE_W *iface = (const DEV_BROADCAST_DEVICEINTERFACE_W *)hdr;
+
+        if (!IsEqualGUID(&iface->dbcc_classguid, &comport_iface)) return TRUE;
+        trace("%s for a COM port interface.\n", arrival ? "DBT_DEVICEARRIVAL" : "DBT_DEVICEREMOVECOMPLETE");
+        if ((key = open_serialcomm()))
+        {
+            list_com_ports(key, arrival ? port_device.iface_arrival_listed : port_device.iface_removal_listed, FALSE);
+            RegCloseKey(key);
+        }
+        lstrcpynW(arrival ? port_device.iface_arrival_name : port_device.iface_removal_name, iface->dbcc_name, MAX_PATH);
+        if (arrival) port_device.iface_arrival = ++port_device.seq;
+        else port_device.iface_removal = ++port_device.seq;
+    }
+    else if (hdr->dbch_devicetype == DBT_DEVTYP_PORT)
+    {
+        const DEV_BROADCAST_PORT_W *port = (const DEV_BROADCAST_PORT_W *)hdr;
+
+        if (!(n = com_number(port->dbcp_name))) return TRUE;
+        trace("%s for COM%lu.\n", arrival ? "DBT_DEVICEARRIVAL" : "DBT_DEVICEREMOVECOMPLETE", n);
+        if (arrival)
+        {
+            port_device.port_arrival = ++port_device.seq;
+            port_device.port_arrival_n = n;
+        }
+        else
+        {
+            port_device.port_removal = ++port_device.seq;
+            port_device.port_removal_n = n;
+        }
+    }
+    return TRUE;
+}
+
+/* the node of the Ports class whose PortName is COMn: its instance id, DEVPKEY_NAME and friendly name */
+static BOOL find_port_node(DWORD n, DWORD flags, WCHAR *instance, WCHAR *name, WCHAR *friendly)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    WCHAR port[16], want[16];
+    DEVPROPTYPE type;
+    BOOL found = FALSE;
+    HDEVINFO set;
+    DWORD i, size;
+    HKEY key;
+
+    swprintf(want, ARRAY_SIZE(want), L"COM%lu", n);
+    set = SetupDiGetClassDevsW(&ports_class, NULL, NULL, flags);
+    if (set == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; !found && SetupDiEnumDeviceInfo(set, i, &device); i++)
+    {
+        key = SetupDiOpenDevRegKey(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE);
+        if (key == INVALID_HANDLE_VALUE) continue;
+        size = sizeof(port) - sizeof(WCHAR);
+        memset(port, 0, sizeof(port));
+        found = !RegQueryValueExW(key, L"PortName", NULL, NULL, (BYTE *)port, &size) && !wcsicmp(port, want);
+        RegCloseKey(key);
+        if (!found) continue;
+        if (!SetupDiGetDeviceInstanceIdW(set, &device, instance, MAX_PATH, NULL)) instance[0] = 0;
+        if (!SetupDiGetDevicePropertyW(set, &device, &name_key, &type, (BYTE *)name, MAX_PATH * sizeof(WCHAR), NULL, 0))
+            name[0] = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(set, &device, SPDRP_FRIENDLYNAME, NULL, (BYTE *)friendly,
+                                               MAX_PATH * sizeof(WCHAR), NULL))
+            friendly[0] = 0;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
+/* the path of the COM port interface of a node */
+static BOOL find_port_iface(const WCHAR *instance, DWORD flags, WCHAR *path)
+{
+    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    union
+    {
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W detail;
+        WCHAR buffer[MAX_PATH + 8];
+    } u;
+    WCHAR id[MAX_PATH];
+    BOOL found = FALSE;
+    HDEVINFO set;
+    DWORD i;
+
+    set = SetupDiGetClassDevsW(&comport_iface, NULL, NULL, DIGCF_DEVICEINTERFACE | flags);
+    if (set == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; !found && SetupDiEnumDeviceInterfaces(set, NULL, &comport_iface, i, &iface); i++)
+    {
+        u.detail.cbSize = sizeof(u.detail);
+        if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, &u.detail, sizeof(u), NULL, &device)) continue;
+        if (!SetupDiGetDeviceInstanceIdW(set, &device, id, ARRAY_SIZE(id), NULL) || wcsicmp(id, instance)) continue;
+        lstrcpynW(path, u.detail.DevicePath, MAX_PATH);
+        found = TRUE;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
+/* the driver of a port: every port has a versioned one, and a CDC ACM port has the USB serial driver of the system */
+static void test_port_driver(const WCHAR *instance, DWORD n)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    WCHAR id[MAX_PATH], inf[MAX_PATH] = {0}, version[64] = {0}, provider[MAX_PATH] = {0}, compatible[1024] = {0};
+    const WCHAR *pos;
+    DEVPROPTYPE type;
+    BOOL found = FALSE, cdc = FALSE;
+    HDEVINFO set;
+    DWORD i;
+
+    set = SetupDiGetClassDevsW(&ports_class, NULL, NULL, 0);
+    if (set == INVALID_HANDLE_VALUE) return;
+    for (i = 0; !found && SetupDiEnumDeviceInfo(set, i, &device); i++)
+    {
+        if (!SetupDiGetDeviceInstanceIdW(set, &device, id, ARRAY_SIZE(id), NULL)) continue;
+        found = !wcsicmp(id, instance);
+        if (!found) continue;
+        SetupDiGetDevicePropertyW(set, &device, &driver_inf_key, &type, (BYTE *)inf, sizeof(inf), NULL, 0);
+        SetupDiGetDevicePropertyW(set, &device, &driver_version_key, &type, (BYTE *)version, sizeof(version), NULL, 0);
+        SetupDiGetDevicePropertyW(set, &device, &driver_provider_key, &type, (BYTE *)provider, sizeof(provider), NULL, 0);
+        SetupDiGetDeviceRegistryPropertyW(set, &device, SPDRP_COMPATIBLEIDS, NULL, (BYTE *)compatible,
+                                          sizeof(compatible) - 2 * sizeof(WCHAR), NULL);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    ok(found, "COM%lu: its node is not listed.\n", n);
+    if (!found) return;
+    for (pos = compatible; *pos; pos += wcslen(pos) + 1)
+        if (!wcsnicmp(pos, L"USB\\Class_02&SubClass_02", 24)) cdc = TRUE;
+    trace("COM%lu: driver %s, version %s, CDC ACM %d.\n", n, wine_dbgstr_w(inf), wine_dbgstr_w(version), cdc);
+    ok(*inf, "COM%lu: got no driver INF.\n", n);
+    ok(*version, "COM%lu: got no driver version.\n", n);
+    ok(*provider, "COM%lu: got no driver provider.\n", n);
+    if (cdc) ok(!wcsicmp(inf, L"usbser.inf"), "COM%lu: got driver INF %s.\n", n, wine_dbgstr_w(inf));
+}
+
+static BOOL names_port(const WCHAR *name, DWORD n)
+{
+    WCHAR suffix[16];
+    size_t len = wcslen(name), suffix_len;
+
+    swprintf(suffix, ARRAY_SIZE(suffix), L" (COM%lu)", n);
+    suffix_len = wcslen(suffix);
+    return len > suffix_len && !wcscmp(name + len - suffix_len, suffix);
+}
+
+/* the enumerator and device id of an instance id, without the instance part (a serial number) */
+static const char *debugstr_device(const WCHAR *instance)
+{
+    const WCHAR *end = wcschr(instance, '\\');
+
+    if (end) end = wcschr(end + 1, '\\');
+    return wine_dbgstr_wn(instance, end ? end - instance : -1);
+}
+
+static void wait_port_device_messages(DWORD n, BOOL arrival)
+{
+    DWORD start = GetTickCount();
+
+    while (GetTickCount() - start < 5000)
+    {
+        if (arrival && port_device.iface_arrival && port_device.port_arrival_n == n) break;
+        if (!arrival && port_device.iface_removal && port_device.port_removal_n == n) break;
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 20, QS_ALLINPUT);
+        pump_messages();
+    }
+}
+
+/* a USB serial port is a node of the Ports class with a COM port interface, complete when SERIALCOMM lists the port;
+ * windows registered for the interface class get its arrival after SERIALCOMM changed, before the port message */
+static void test_port_device(void)
+{
+    WNDCLASSW class = { .lpfnWndProc = port_device_wndproc, .lpszClassName = L"comm_port_device" };
+    DEV_BROADCAST_DEVICEINTERFACE_W filter = { sizeof(filter), DBT_DEVTYP_DEVICEINTERFACE };
+    WCHAR instance[MAX_PATH], name[MAX_PATH], friendly[MAX_PATH], path[MAX_PATH], node[MAX_PATH] = {0};
+    WCHAR other[MAX_PATH], other_name[MAX_PATH], other_friendly[MAX_PATH];
+    BOOL listed[MAX_COM_PORTS + 1], notified, found;
+    DWORD i, n, last_notify;
+    HDEVNOTIFY notify;
+    HANDLE event;
+    HWND hwnd;
+    HKEY key;
+    int change;
+
+    if (!(key = open_serialcomm()))
+    {
+        skip("No SERIALCOMM key.\n");
+        return;
+    }
+    event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    class.hInstance = GetModuleHandleW(NULL);
+    RegisterClassW(&class);
+    hwnd = CreateWindowExW(0, class.lpszClassName, NULL, 0, 0, 0, 0, 0, NULL, NULL, class.hInstance, NULL);
+    ok(hwnd != NULL, "CreateWindowExW failed, error %lu.\n", GetLastError());
+    filter.dbcc_classguid = comport_iface;
+    notify = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    ok(notify != NULL, "RegisterDeviceNotificationW failed, error %lu.\n", GetLastError());
+    list_com_ports(key, listed, TRUE);
+    wait_messages(1000);
+    notify_serialcomm(key, event);
+    last_notify = GetTickCount() - 10000;
+
+    trace("Unplug a USB serial port and plug it back, or plug one in and unplug it, within %u seconds.\n",
+          HOTPLUG_TIMEOUT / 1000);
+    for (i = 0; i < 2; i++)
+    {
+        memset(&port_device, 0, sizeof(port_device));
+        change = wait_port_change(key, event, listed, &last_notify, &notified);
+        ok(change, "No COM port was added or removed in %u seconds.\n", HOTPLUG_TIMEOUT / 1000);
+        if (!change) continue;
+        n = abs(change);
+        path[0] = 0;
+
+        if (change > 0)
+        {
+            trace("COM%lu was added.\n", n);
+            found = find_port_node(n, DIGCF_PRESENT, instance, name, friendly);
+            ok(found, "No present Ports node had PortName COM%lu when SERIALCOMM listed it.\n", n);
+            wait_port_device_messages(n, TRUE);
+            ok(port_device.iface_arrival != 0, "Got no DBT_DEVICEARRIVAL for the interface of COM%lu.\n", n);
+            if (port_device.iface_arrival)
+            {
+                ok(port_device.iface_arrival_listed[n], "The interface of COM%lu arrived before SERIALCOMM listed it.\n", n);
+                ok(port_device.port_arrival_n != n || port_device.iface_arrival < port_device.port_arrival,
+                   "The interface of COM%lu arrived after the port.\n", n);
+            }
+            if (!found) found = find_port_node(n, DIGCF_PRESENT, instance, name, friendly);
+            if (!found) continue;
+            ok(!wcsnicmp(instance, L"USB\\VID_", 8), "COM%lu: got node %s.\n", n, debugstr_device(instance));
+            ok(names_port(name, n), "COM%lu: got name %s.\n", n, wine_dbgstr_w(name));
+            ok(names_port(friendly, n), "COM%lu: got friendly name %s.\n", n, wine_dbgstr_w(friendly));
+            ok(find_port_iface(instance, DIGCF_PRESENT, path), "COM%lu: its node has no present COM port interface.\n", n);
+            test_port_driver(instance, n);
+            if (*path && port_device.iface_arrival)
+                ok(!wcsicmp(path, port_device.iface_arrival_name), "COM%lu: the arrival was for another interface.\n", n);
+            if (*node) ok(!wcsicmp(instance, node), "COM%lu came back on another node.\n", n);
+            lstrcpyW(node, instance);
+        }
+        else
+        {
+            trace("COM%lu was removed.\n", n);
+            wait_port_device_messages(n, FALSE);
+            ok(port_device.iface_removal != 0, "Got no DBT_DEVICEREMOVECOMPLETE for the interface of COM%lu.\n", n);
+            if (port_device.iface_removal)
+            {
+                ok(!port_device.iface_removal_listed[n], "The interface of COM%lu left while SERIALCOMM listed it.\n", n);
+                ok(port_device.port_removal_n != n || port_device.iface_removal < port_device.port_removal,
+                   "The interface of COM%lu left after the port.\n", n);
+            }
+            /* the node stays, not present, with its interface disabled */
+            found = find_port_node(n, 0, instance, name, friendly);
+            ok(found, "No Ports node has PortName COM%lu after it left.\n", n);
+            if (!found) continue;
+            ok(!find_port_iface(instance, DIGCF_PRESENT, path), "COM%lu: the COM port interface is still present.\n", n);
+            if (find_port_iface(instance, 0, path) && port_device.iface_removal)
+                ok(!wcsicmp(path, port_device.iface_removal_name), "COM%lu: the removal was for another interface.\n", n);
+            if (*node) ok(!wcsicmp(instance, node), "COM%lu left from another node.\n", n);
+            lstrcpyW(node, instance);
+            ok(!find_port_node(n, DIGCF_PRESENT, other, other_name, other_friendly),
+               "COM%lu: its node is still listed as present.\n", n);
+        }
+    }
+
+    UnregisterDeviceNotification(notify);
+    DestroyWindow(hwnd);
+    UnregisterClassW(class.lpszClassName, class.hInstance);
+    CloseHandle(event);
+    RegCloseKey(key);
+}
+
 START_TEST(comm)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -3406,4 +3702,5 @@ START_TEST(comm)
     test_WaitCommEvent();
     test_port_hotplug();
     test_port_hotplug_busy();
+    test_port_device();
 }
