@@ -790,6 +790,22 @@ static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struc
         return return_property_bool( prop, present ? DEVPROP_TRUE : DEVPROP_FALSE );
     }
 
+    /* like on Windows, the name of a device is its friendly name, or its description; a name set by its
+     * driver comes in between */
+    if (!memcmp( &DEVPKEY_NAME, &prop->key, sizeof(prop->key) ))
+    {
+        DWORD size = *prop->size;
+        LSTATUS err;
+
+        if ((err = query_named_property( hkey, L"FriendlyName", DEVPROP_TYPE_STRING, prop )) != ERROR_NOT_FOUND)
+            return err;
+        *prop->size = size;
+        if ((err = query_property( hkey, L"Properties\\", DEVPROP_TYPE_STRING, prop )) != ERROR_NOT_FOUND)
+            return err;
+        *prop->size = size;
+        return query_named_property( hkey, L"DeviceDesc", DEVPROP_TYPE_STRING, prop );
+    }
+
     for (UINT i = 0; i < ARRAY_SIZE(device_properties); i++)
     {
         const struct property_desc *desc = device_properties + i;
