@@ -315,6 +315,8 @@ HKLM,System\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be1031
 HKLM,System\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318},"Class",,"DiskDrive"
 HKLM,System\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318},,,"Display adapters"
 HKLM,System\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318},"Class",,"Display"
+HKLM,System\CurrentControlSet\Control\Class\{4d36e96d-e325-11ce-bfc1-08002be10318},,,"Modems"
+HKLM,System\CurrentControlSet\Control\Class\{4d36e96d-e325-11ce-bfc1-08002be10318},"Class",,"Modem"
 HKLM,System\CurrentControlSet\Control\Class\{4d36e96e-e325-11ce-bfc1-08002be10318},,,"Monitors"
 HKLM,System\CurrentControlSet\Control\Class\{4d36e96e-e325-11ce-bfc1-08002be10318},"Class",,"Monitor"
 HKLM,System\CurrentControlSet\Control\Class\{4d36e978-e325-11ce-bfc1-08002be10318},,,"Ports (COM & LPT)"
