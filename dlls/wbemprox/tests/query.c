@@ -25,6 +25,7 @@
 #include "initguid.h"
 #include "objidl.h"
 #include "wbemcli.h"
+#include "setupapi.h"
 #include "wine/test.h"
 
 static HRESULT exec_query( IWbemServices *services, const WCHAR *str, IEnumWbemClassObject **result )
@@ -2115,6 +2116,72 @@ static void test_Win32_PnPEntity( IWbemServices *services )
     IEnumWbemClassObject_Release( enm );
 }
 
+static ULONG count_pnp_entities( IWbemServices *services, const WCHAR *device_id )
+{
+    BSTR class = SysAllocString( L"Win32_PnPEntity" );
+    IEnumWbemClassObject *result;
+    IWbemClassObject *obj;
+    ULONG count, total = 0;
+    HRESULT hr;
+    VARIANT val;
+
+    hr = IWbemServices_CreateInstanceEnum( services, class, 0, NULL, &result );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    if (hr == S_OK)
+    {
+        for (;;)
+        {
+            IEnumWbemClassObject_Next( result, 10000, 1, &obj, &count );
+            if (!count) break;
+            hr = IWbemClassObject_Get( obj, L"DeviceId", 0, &val, NULL, NULL );
+            ok( hr == S_OK, "got %#lx\n", hr );
+            if (hr == S_OK && V_VT( &val ) == VT_BSTR && !wcsicmp( V_BSTR( &val ), device_id )) total++;
+            VariantClear( &val );
+            IWbemClassObject_Release( obj );
+        }
+        IEnumWbemClassObject_Release( result );
+    }
+    SysFreeString( class );
+    return total;
+}
+
+static void test_Win32_PnPEntity_present( IWbemServices *services )
+{
+    static const GUID class = {0x6a55b5a4, 0x3f65, 0x11db, {0xb7,0x04,0x00,0x11,0x95,0x5c,0x2b,0xdb}};
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    HDEVINFO set;
+    ULONG count;
+    BOOL ret;
+
+    set = SetupDiCreateDeviceInfoList( &class, NULL );
+    ok( set != INVALID_HANDLE_VALUE, "failed to create device list, error %lu\n", GetLastError() );
+
+    ret = SetupDiCreateDeviceInfoW( set, L"Root\\LEGACY_WBEMPROX\\0000", &class, NULL, NULL, 0, &device );
+    if (!ret && GetLastError() == ERROR_ACCESS_DENIED)
+    {
+        skip( "needs admin rights\n" );
+        SetupDiDestroyDeviceInfoList( set );
+        return;
+    }
+    ok( ret, "failed to create device, error %lu\n", GetLastError() );
+
+    /* only present devices are listed */
+    count = count_pnp_entities( services, L"ROOT\\LEGACY_WBEMPROX\\0000" );
+    ok( !count, "phantom device listed %lu times\n", count );
+
+    ret = SetupDiRegisterDeviceInfo( set, &device, 0, NULL, NULL, NULL );
+    ok( ret, "failed to register device, error %lu\n", GetLastError() );
+    count = count_pnp_entities( services, L"ROOT\\LEGACY_WBEMPROX\\0000" );
+    ok( count == 1, "registered device listed %lu times\n", count );
+
+    ret = SetupDiRemoveDevice( set, &device );
+    ok( ret, "failed to remove device, error %lu\n", GetLastError() );
+    count = count_pnp_entities( services, L"ROOT\\LEGACY_WBEMPROX\\0000" );
+    ok( !count, "removed device listed %lu times\n", count );
+
+    SetupDiDestroyDeviceInfoList( set );
+}
+
 static void test_Win32_WinSAT( IWbemServices *services )
 {
     BSTR wql = SysAllocString( L"wql" ), query = SysAllocString( L"SELECT * FROM Win32_WinSAT" );
@@ -2687,6 +2754,7 @@ START_TEST(query)
     test_Win32_PhysicalMemory( services );
     test_Win32_PhysicalMemoryArray( services );
     test_Win32_PnPEntity( services );
+    test_Win32_PnPEntity_present( services );
     test_Win32_Printer( services );
     test_Win32_Process( services, FALSE );
     test_Win32_Process( services, TRUE );
