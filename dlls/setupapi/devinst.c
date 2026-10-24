@@ -4359,6 +4359,17 @@ static DWORD get_device_property( struct device *device, HDEVINFO devinfo, PSP_D
     else if (IsEqualDevPropKey( *prop_key, DEVPKEY_Device_ContainerId ))
         ret = get_device_property( device, devinfo, device_data, &DEVPKEY_Device_BaseContainerId, prop_type, buf,
                                     buf_size, req_size, flags );
+    else if (IsEqualDevPropKey( *prop_key, DEVPKEY_Device_IsPresent ))
+    {
+        /* Presence isn't stored with the device, cfgmgr32 computes it. */
+        ULONG size = buf_size;
+        CONFIGRET cr;
+
+        cr = CM_Get_DevNode_PropertyW( device->devnode, prop_key, prop_type, buf, &size, 0 );
+        if (req_size && (cr == CR_SUCCESS || cr == CR_BUFFER_SMALL))
+            *req_size = size;
+        ret = CM_MapCrToWin32Err( cr, ERROR_NOT_FOUND );
+    }
     else
         ret = get_device_reg_property( device->key, prop_key, prop_type, buf, buf_size, req_size, flags );
     return ret;
