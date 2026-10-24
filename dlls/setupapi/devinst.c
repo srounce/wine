@@ -4305,6 +4305,28 @@ static DWORD get_device_property( struct device *device, HDEVINFO devinfo, PSP_D
     if (flags)
         return ERROR_INVALID_FLAGS;
 
+    /* like on Windows, the name of a device is its friendly name, or its description; a name set by its
+     * driver comes in between */
+    if (IsEqualDevPropKey( *prop_key, DEVPKEY_NAME ))
+    {
+        DWORD size = 0;
+
+        if (SetupDiGetDeviceRegistryPropertyW( devinfo, device_data, SPDRP_FRIENDLYNAME, NULL, buf, buf_size, &size ))
+            ret = ERROR_SUCCESS;
+        else if ((ret = GetLastError()) == ERROR_INVALID_DATA &&
+                 (ret = get_device_reg_property( device->key, prop_key, prop_type, buf, buf_size, req_size, flags )) != ERROR_NOT_FOUND)
+            return ret;
+        else if (ret == ERROR_NOT_FOUND)
+            ret = SetupDiGetDeviceRegistryPropertyW( devinfo, device_data, SPDRP_DEVICEDESC, NULL, buf, buf_size, &size )
+                  ? ERROR_SUCCESS : GetLastError();
+        if (ret == ERROR_INVALID_DATA)
+            return ERROR_NOT_FOUND;
+        *prop_type = DEVPROP_TYPE_STRING;
+        if (req_size)
+            *req_size = size;
+        return ret;
+    }
+
     if (IsEqualGUID( &prop_key->fmtid, &DEVPKEY_Device_DeviceDesc.fmtid ) && prop_key->pid >= 2)
     {
         DWORD reg_prop = prop_key->pid - 2, size, type;
