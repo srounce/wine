@@ -5831,6 +5831,89 @@ static void test_class_guids_from_name(void)
     ok(!res, "Failed to delete class key, error %lu.\n", res);
 }
 
+static CONFIGRET (WINAPI *pCM_Get_DevNode_PropertyW)(DEVINST, const DEVPROPKEY *, DEVPROPTYPE *, BYTE *, ULONG *, ULONG);
+
+static void check_device_name_(int line, HDEVINFO set, SP_DEVINFO_DATA *device, const WCHAR *expect)
+{
+    WCHAR buffer[MAX_PATH];
+    DEVPROPTYPE type;
+    CONFIGRET cr;
+    DWORD size;
+    ULONG len;
+    BOOL ret;
+
+    type = 0xdeadbeef;
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDevicePropertyW(set, device, &DEVPKEY_NAME, &type, (BYTE *)buffer, sizeof(buffer), &size, 0);
+    if (expect)
+    {
+        ok_(__FILE__, line)(ret, "Failed to get DEVPKEY_NAME, error %#lx.\n", GetLastError());
+        ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "Got type %#lx.\n", type);
+        ok_(__FILE__, line)(size == (wcslen(expect) + 1) * sizeof(WCHAR), "Got size %lu.\n", size);
+        ok_(__FILE__, line)(ret && !wcscmp(buffer, expect), "Got name %s, expected %s.\n",
+                ret ? debugstr_w(buffer) : "(none)", debugstr_w(expect));
+    }
+    else
+    {
+        ok_(__FILE__, line)(!ret, "Got name %s.\n", debugstr_w(buffer));
+        ok_(__FILE__, line)(GetLastError() == ERROR_NOT_FOUND, "Got error %#lx.\n", GetLastError());
+    }
+
+    if (!pCM_Get_DevNode_PropertyW) return;
+    type = 0xdeadbeef;
+    len = sizeof(buffer);
+    cr = pCM_Get_DevNode_PropertyW(device->DevInst, &DEVPKEY_NAME, &type, (BYTE *)buffer, &len, 0);
+    if (expect)
+    {
+        ok_(__FILE__, line)(cr == CR_SUCCESS, "CM_Get_DevNode_PropertyW returned %#lx.\n", cr);
+        ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "Got type %#lx.\n", type);
+        ok_(__FILE__, line)(!cr && !wcscmp(buffer, expect), "CM_Get_DevNode_PropertyW: got name %s, expected %s.\n",
+                cr ? "(none)" : debugstr_w(buffer), debugstr_w(expect));
+    }
+    else ok_(__FILE__, line)(cr == CR_NO_SUCH_VALUE, "CM_Get_DevNode_PropertyW returned %#lx.\n", cr);
+}
+#define check_device_name(a,b,c) check_device_name_(__LINE__,a,b,c)
+
+static void test_device_name(void)
+{
+    static const WCHAR desc[] = L"Wine test device", friendly[] = L"Wine test device (COM99)";
+    static const WCHAR stale[] = L"Stale name (COM98)";
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    HDEVINFO set;
+    BOOL ret;
+
+    pCM_Get_DevNode_PropertyW = (void *)GetProcAddress(LoadLibraryA("cfgmgr32.dll"), "CM_Get_DevNode_PropertyW");
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInfoW(set, L"Root\\LEGACY_BOGUS\\0000", &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+
+    /* the name of a device is its friendly name, or else its description */
+    check_device_name(set, &device, NULL);
+    ret = SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_DEVICEDESC, (const BYTE *)desc, sizeof(desc));
+    ok(ret, "Failed to set description, error %#lx.\n", GetLastError());
+    check_device_name(set, &device, desc);
+    ret = SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_FRIENDLYNAME, (const BYTE *)friendly, sizeof(friendly));
+    ok(ret, "Failed to set friendly name, error %#lx.\n", GetLastError());
+    check_device_name(set, &device, friendly);
+
+    /* it can't be set on its own; Wine lets drivers set it (winebth names its radios),
+     * and the friendly name still comes first */
+    SetLastError(0xdeadbeef);
+    ret = SetupDiSetDevicePropertyW(set, &device, &DEVPKEY_NAME, DEVPROP_TYPE_STRING, (const BYTE *)stale, sizeof(stale), 0);
+    todo_wine ok(!ret, "Expected failure.\n");
+    todo_wine ok(GetLastError() == ERROR_ACCESS_DENIED, "Got unexpected error %#lx.\n", GetLastError());
+    check_device_name(set, &device, friendly);
+
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 START_TEST(devinst)
 {
     static BOOL (WINAPI *pIsWow64Process)(HANDLE, BOOL *);
@@ -5861,6 +5944,7 @@ START_TEST(devinst)
     test_class_guids_from_name();
     test_device_info();
     test_device_property();
+    test_device_name();
     test_get_device_instance_id();
     test_open_device_info();
     test_register_device_info();
