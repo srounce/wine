@@ -569,6 +569,35 @@ static NTSTATUS pdo_pnp(struct bus_device *dev, IRP *irp, IO_STACK_LOCATION *sta
             ok(!kmemcmp(pdo->iface_symlink.Buffer, expect_symlink, pdo->iface_symlink.MaximumLength),
                     "Got symlink \"%ls\".\n", pdo->iface_symlink.Buffer);
             IoSetDeviceInterfaceState(&pdo->iface_symlink, TRUE);
+
+            if (desc->hold_start)
+            {
+                LARGE_INTEGER wait_time = {.QuadPart = -5000 * 10000};
+                HANDLE entered = NULL, release = NULL;
+                OBJECT_ATTRIBUTES attr;
+                UNICODE_STRING string;
+
+                RtlInitUnicodeString(&string, L"\\BaseNamedObjects\\winetest_pnp_start_entered");
+                InitializeObjectAttributes(&attr, &string, OBJ_KERNEL_HANDLE | OBJ_OPENIF, NULL, NULL);
+                status = ZwCreateEvent(&entered, EVENT_ALL_ACCESS, &attr, SynchronizationEvent, FALSE);
+                ok(NT_SUCCESS(status), "Failed to open start entered event, status %#lx.\n", status);
+                RtlInitUnicodeString(&string, L"\\BaseNamedObjects\\winetest_pnp_start_release");
+                InitializeObjectAttributes(&attr, &string, OBJ_KERNEL_HANDLE | OBJ_OPENIF, NULL, NULL);
+                status = ZwCreateEvent(&release, EVENT_ALL_ACCESS, &attr, SynchronizationEvent, FALSE);
+                ok(NT_SUCCESS(status), "Failed to open start release event, status %#lx.\n", status);
+
+                if (entered && release)
+                {
+                    status = ZwSetEvent(entered, NULL);
+                    ok(!status, "Failed to set event, status %#lx.\n", status);
+                    status = ZwWaitForSingleObject(release, FALSE, &wait_time);
+                    ok(!status, "Failed to wait for start release, status %#lx.\n", status);
+                }
+
+                if (entered) ZwClose(entered);
+                if (release) ZwClose(release);
+            }
+
             ret = STATUS_SUCCESS;
             break;
         }
@@ -576,7 +605,9 @@ static NTSTATUS pdo_pnp(struct bus_device *dev, IRP *irp, IO_STACK_LOCATION *sta
         case IRP_MN_REMOVE_DEVICE:
             if (pdo->removed)
             {
-                IoSetDeviceInterfaceState(&pdo->iface_symlink, FALSE);
+                /* A device which was never started has no interface. */
+                if (pdo->iface_symlink.Buffer)
+                    IoSetDeviceInterfaceState(&pdo->iface_symlink, FALSE);
                 RtlFreeUnicodeString(&pdo->iface_symlink);
                 irp->IoStatus.Status = STATUS_SUCCESS;
                 IoCompleteRequest(irp, IO_NO_INCREMENT);
