@@ -379,8 +379,6 @@ static void start_device( DEVICE_OBJECT *device, HDEVINFO set, SP_DEVINFO_DATA *
     load_function_driver( device, set, sp_device );
     if (device->DriverObject)
         send_pnp_irp( device, IRP_MN_START_DEVICE );
-
-    create_dyn_data_key( device );
 }
 
 static unsigned int hash_wchar_path( const WCHAR *id_path )
@@ -660,6 +658,10 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
     if (!get_device_instance_id( parent_device, parent_id ))
         SetupDiSetDevicePropertyW( set, &sp_device, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
                 (BYTE *)parent_id, (wcslen( parent_id ) + 1) * sizeof(WCHAR), 0 );
+
+    /* The device is present from now on, even if no driver can be installed
+     * for it, and while it is being started. */
+    create_dyn_data_key( device );
 
     if (need_driver && !install_device_driver( device, set, &sp_device ) && !caps.RawDeviceOK)
     {
@@ -1879,6 +1881,7 @@ void CDECL wine_enumerate_root_devices( const WCHAR *driver_name )
                 sizeof(root_container_id) ))
             ERR("Failed to set container ID on root device %s.\n", debugstr_w(id));
 
+        create_dyn_data_key( device );
         start_device( device, set, &sp_device );
     }
 
