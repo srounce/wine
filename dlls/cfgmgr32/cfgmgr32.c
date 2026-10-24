@@ -707,10 +707,88 @@ static const struct property_desc device_properties[] =
     { &DEVPKEY_Device_SafeRemovalRequiredOverride,  DEVPROP_TYPE_BOOLEAN },
 };
 
+/* ntoskrnl creates a volatile key with the instance ID of each device it
+ * has enumerated, and deletes it when the device is removed. */
+static WCHAR *get_enumerated_devices(void)
+{
+    WCHAR name[16], id[MAX_DEVICE_ID_LEN], *ret, *tmp;
+    UINT len = 0, capacity = 256;
+    DWORD size, type;
+    HKEY root, hkey;
+
+    if (!(ret = malloc( capacity * sizeof(*ret) ))) return NULL;
+    *ret = 0;
+    if (RegOpenKeyExW( HKEY_DYN_DATA, L"Config Manager\\Enum", 0, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &root ))
+        return ret;
+
+    for (UINT i = 0; !RegEnumKeyW( root, i, name, ARRAY_SIZE(name) ); i++)
+    {
+        if (RegOpenKeyExW( root, name, 0, KEY_QUERY_VALUE, &hkey )) continue;
+        size = sizeof(id) - sizeof(WCHAR);
+        if (RegQueryValueExW( hkey, L"HardWareKey", NULL, &type, (BYTE *)id, &size ) || type != REG_SZ) size = 0;
+        RegCloseKey( hkey );
+        if (!size) continue;
+        id[size / sizeof(WCHAR)] = 0; /* ntoskrnl doesn't store the terminator */
+
+        size = wcslen( id ) + 1;
+        if (len + size + 1 > capacity)
+        {
+            capacity = max( capacity * 2, len + size + 1 );
+            if (!(tmp = realloc( ret, capacity * sizeof(*ret) )))
+            {
+                free( ret );
+                ret = NULL;
+                break;
+            }
+            ret = tmp;
+        }
+        wcscpy( ret + len, id );
+        len += size;
+        ret[len] = 0;
+    }
+
+    RegCloseKey( root );
+    return ret;
+}
+
+static BOOL device_is_present( HKEY hkey, const struct device *dev, const WCHAR *enumerated )
+{
+    DWORD value = 0, size = sizeof(value);
+    WCHAR path[MAX_DEVICE_ID_LEN];
+    struct property prop;
+    DEVPROPTYPE type;
+    UINT len, id_len;
+
+    /* The root enumerator is the registry itself: like on Windows, a root
+     * device is present once registered, even without a driver. */
+    if (!wcsicmp( dev->enumerator, L"ROOT" ))
+        return RegQueryValueExW( hkey, L"Phantom", NULL, NULL, (BYTE *)&value, &size ) || !value;
+
+    len = swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\%s", dev->enumerator, dev->device, dev->instance );
+    for (const WCHAR *id = enumerated; *id; id += id_len + 1)
+        if ((id_len = wcslen( id )) == len && !wcsicmp( id, path )) return TRUE;
+
+    /* Devices which aren't enumerated by ntoskrnl, such as the GPUs and monitors
+     * from win32u, have DEVPKEY_Device_IsPresent set by their creator. */
+    init_property( &prop, &DEVPKEY_Device_IsPresent, &type, &value, &size, FALSE );
+    return !query_property( hkey, L"Properties\\", DEVPROP_TYPE_BOOLEAN, &prop ) && value;
+}
+
 static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struct property *prop )
 {
     if (!memcmp( &DEVPKEY_Device_InstanceId, &prop->key, sizeof(prop->key) ))
         return return_property_string( prop, dev->instance );
+
+    if (!memcmp( &DEVPKEY_Device_IsPresent, &prop->key, sizeof(prop->key) ))
+    {
+        WCHAR *enumerated;
+        BOOL present;
+
+        if (!(enumerated = get_enumerated_devices())) return ERROR_OUTOFMEMORY;
+        present = device_is_present( hkey, dev, enumerated );
+        free( enumerated );
+        return return_property_bool( prop, present ? DEVPROP_TRUE : DEVPROP_FALSE );
+    }
 
     for (UINT i = 0; i < ARRAY_SIZE(device_properties); i++)
     {
@@ -819,8 +897,9 @@ static LSTATUS matches_device_property( HKEY hkey, struct device *dev, const DEV
     return wcsicmp( buffer, value ) ? ERROR_NO_MATCH : ERROR_SUCCESS;
 }
 
+/* enumerated is the list from get_enumerated_devices() to only enumerate present devices, or NULL for all */
 static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPROPKEY *key, const WCHAR *value,
-                                      BOOL all, enum_objects_cb callback, void *context )
+                                      const WCHAR *enumerated, enum_objects_cb callback, void *context )
 {
     LSTATUS err = ERROR_SUCCESS;
     HKEY hkey;
@@ -830,7 +909,7 @@ static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPR
     {
         if ((err = open_key( root, dev->instance, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, TRUE, &hkey ))) break;
         if ((err = matches_device_property( hkey, dev, key, value )) == ERROR_NO_MATCH) err = ERROR_SUCCESS;
-        else if (!err)
+        else if (!err && (!enumerated || device_is_present( hkey, dev, enumerated )))
         {
             WCHAR path[MAX_PATH];
             len = swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\%s", dev->enumerator, dev->device, dev->instance );
@@ -844,7 +923,7 @@ static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPR
 }
 
 static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCHAR *device, const DEVPROPKEY *key,
-                                        const WCHAR *prop, BOOL all, enum_objects_cb callback, void *context )
+                                        const WCHAR *prop, const WCHAR *enumerated, enum_objects_cb callback, void *context )
 {
     LSTATUS err = ERROR_SUCCESS;
     HKEY hkey;
@@ -853,7 +932,7 @@ static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCH
     {
         if (device && wcsicmp( dev->device, device )) continue;
         if ((err = open_key( root, dev->device, KEY_ENUMERATE_SUB_KEYS, TRUE, &hkey ))) break;
-        err = enum_device_instances( hkey, dev, key, prop, all, callback, context );
+        err = enum_device_instances( hkey, dev, key, prop, enumerated, callback, context );
         RegCloseKey( hkey );
     }
     if (err == ERROR_NO_MORE_ITEMS) err = ERROR_SUCCESS;
@@ -863,7 +942,7 @@ static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCH
 
 static LSTATUS enum_devices( const WCHAR *filter, const DEVPROPKEY *key, const WCHAR *value, BOOL all, enum_objects_cb callback, void *context )
 {
-    WCHAR enumerator[MAX_PATH], *device = NULL;
+    WCHAR enumerator[MAX_PATH], *device = NULL, *enumerated = NULL;
     LSTATUS err = ERROR_SUCCESS;
     struct device dev;
     HKEY root, hkey;
@@ -879,15 +958,17 @@ static LSTATUS enum_devices( const WCHAR *filter, const DEVPROPKEY *key, const W
 
     root = cache_root_key( HKEY_LOCAL_MACHINE, enum_rootW, NULL );
     if (root == (HKEY)-1) return ERROR_FILE_NOT_FOUND;
+    if (!all && !(enumerated = get_enumerated_devices())) return ERROR_OUTOFMEMORY;
 
     for (UINT i = 0; !err && !(err = RegEnumKeyW( root, i, dev.enumerator, ARRAY_SIZE(dev.enumerator) )); i++)
     {
         if (filter && wcsicmp( dev.enumerator, enumerator )) continue;
         if ((err = open_key( root, dev.enumerator, KEY_ENUMERATE_SUB_KEYS, TRUE, &hkey ))) break;
-        err = enum_enumerator_devices( hkey, &dev, device, key, value, all, callback, context );
+        err = enum_enumerator_devices( hkey, &dev, device, key, value, enumerated, callback, context );
         RegCloseKey( hkey );
     }
     if (err == ERROR_NO_MORE_ITEMS) err = ERROR_SUCCESS;
+    free( enumerated );
 
     if (!err) callback( NULL, NULL, L"", 1, context );
     return err;
