@@ -967,8 +967,9 @@ BOOL WINAPI SetupDiClassGuidsFromNameExW(const WCHAR *class_name, GUID *guids, D
         ULONG size = sizeof(buffer);
         DEVPROPTYPE type;
 
-        if ((ret = CM_Get_Class_PropertyW(&guid, &DEVPKEY_NAME, &type, (BYTE *)buffer, &size, 0)))
-            break;
+        /* like on Windows, skip the classes whose name can't be read */
+        if (CM_Get_Class_PropertyW(&guid, &DEVPKEY_DeviceClass_ClassName, &type, (BYTE *)buffer, &size, 0))
+            continue;
         if (!wcsicmp(buffer, class_name))
         {
             if (guid_index < guids_size)
