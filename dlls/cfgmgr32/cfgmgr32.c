@@ -686,6 +686,21 @@ static const struct property_desc device_properties[] =
     { &DEVPKEY_Device_FirstInstallDate,             DEVPROP_TYPE_FILETIME },
     { &DEVPKEY_Device_LastArrivalDate,              DEVPROP_TYPE_FILETIME },
     { &DEVPKEY_Device_LastRemovalDate,              DEVPROP_TYPE_FILETIME },
+    { &DEVPKEY_Device_ResourcePickerTags,           DEVPROP_TYPE_STRING,                        L"ResourcePickerTags" },
+    { &DEVPKEY_Device_ResourcePickerExceptions,     DEVPROP_TYPE_STRING,                        L"ResourcePickerExceptions" },
+    { &DEVPKEY_Device_DriverRank,                   DEVPROP_TYPE_UINT32 },
+    { &DEVPKEY_Device_DriverLogoLevel,              DEVPROP_TYPE_UINT32 },
+    { &DEVPKEY_Device_NoConnectSound,               DEVPROP_TYPE_BOOLEAN },
+    { &DEVPKEY_Device_GenericDriverInstalled,       DEVPROP_TYPE_BOOLEAN },
+    { &DEVPKEY_Device_AdditionalSoftwareRequested,  DEVPROP_TYPE_BOOLEAN },
+    { &DEVPKEY_Device_SafeRemovalRequired,          DEVPROP_TYPE_BOOLEAN },
+    { &DEVPKEY_Device_SafeRemovalRequiredOverride,  DEVPROP_TYPE_BOOLEAN },
+};
+
+/* Properties of the driver installed for a device, which setupapi stores in the driver key of the device, and also
+ * as properties of the device. */
+static const struct property_desc driver_properties[] =
+{
     { &DEVPKEY_Device_DriverDate,                   DEVPROP_TYPE_FILETIME,                      L"DriverDateData" },
     { &DEVPKEY_Device_DriverVersion,                DEVPROP_TYPE_STRING,                        L"DriverVersion" },
     { &DEVPKEY_Device_DriverDesc,                   DEVPROP_TYPE_STRING,                        L"DriverDesc" },
@@ -696,15 +711,6 @@ static const struct property_desc device_properties[] =
     { &DEVPKEY_Device_DriverProvider,               DEVPROP_TYPE_STRING,                        L"ProviderName" },
     { &DEVPKEY_Device_DriverPropPageProvider,       DEVPROP_TYPE_STRING,                        L"EnumPropPages32" },
     { &DEVPKEY_Device_DriverCoInstallers,           DEVPROP_TYPE_STRING_LIST,                   L"CoInstallers32" },
-    { &DEVPKEY_Device_ResourcePickerTags,           DEVPROP_TYPE_STRING,                        L"ResourcePickerTags" },
-    { &DEVPKEY_Device_ResourcePickerExceptions,     DEVPROP_TYPE_STRING,                        L"ResourcePickerExceptions" },
-    { &DEVPKEY_Device_DriverRank,                   DEVPROP_TYPE_UINT32 },
-    { &DEVPKEY_Device_DriverLogoLevel,              DEVPROP_TYPE_UINT32 },
-    { &DEVPKEY_Device_NoConnectSound,               DEVPROP_TYPE_BOOLEAN },
-    { &DEVPKEY_Device_GenericDriverInstalled,       DEVPROP_TYPE_BOOLEAN },
-    { &DEVPKEY_Device_AdditionalSoftwareRequested,  DEVPROP_TYPE_BOOLEAN },
-    { &DEVPKEY_Device_SafeRemovalRequired,          DEVPROP_TYPE_BOOLEAN },
-    { &DEVPKEY_Device_SafeRemovalRequiredOverride,  DEVPROP_TYPE_BOOLEAN },
 };
 
 /* ntoskrnl creates a volatile key with the instance ID of each device it
@@ -774,6 +780,25 @@ static BOOL device_is_present( HKEY hkey, const struct device *dev, const WCHAR 
     return !query_property( hkey, L"Properties\\", DEVPROP_TYPE_BOOLEAN, &prop ) && value;
 }
 
+/* Like on Windows, the properties of the driver are device properties, and when there are none, such as for a
+ * device installed before they were stored, they are the values of the driver key. */
+static LSTATUS query_driver_property( HKEY hkey, const struct property_desc *desc, struct property *prop )
+{
+    WCHAR driver[MAX_PATH];
+    DWORD size = sizeof(driver), capacity = *prop->size;
+    LSTATUS err;
+    HKEY driver_key;
+
+    if ((err = query_property( hkey, L"Properties\\", desc->type, prop )) != ERROR_NOT_FOUND) return err;
+
+    *prop->size = capacity;
+    if (RegQueryValueExW( hkey, L"Driver", NULL, NULL, (BYTE *)driver, &size )) return ERROR_NOT_FOUND;
+    if (open_class_key( HKEY_LOCAL_MACHINE, driver, KEY_QUERY_VALUE, TRUE, &driver_key )) return ERROR_NOT_FOUND;
+    err = query_named_property( driver_key, desc->name, desc->type, prop );
+    RegCloseKey( driver_key );
+    return err;
+}
+
 static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struct property *prop )
 {
     if (!memcmp( &DEVPKEY_Device_InstanceId, &prop->key, sizeof(prop->key) ))
@@ -814,6 +839,12 @@ static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struc
         return query_named_property( hkey, desc->name, desc->type, prop );
     }
 
+    for (UINT i = 0; i < ARRAY_SIZE(driver_properties); i++)
+    {
+        const struct property_desc *desc = driver_properties + i;
+        if (!memcmp( desc->key, &prop->key, sizeof(prop->key) )) return query_driver_property( hkey, desc, prop );
+    }
+
     if (!memcmp( &DEVPKEY_Device_DeviceDesc, &prop->key, sizeof(prop->key.fmtid) ))
     {
         FIXME( "property %#lx not implemented\n", prop->key.pid - 1 );
@@ -842,7 +873,9 @@ LSTATUS enum_device_property_keys( HKEY hkey, const struct device *dev, DEVPROPK
 {
     ULONG capacity = *size, count = 0;
     LSTATUS err = ERROR_SUCCESS;
-    HKEY props_key;
+    HKEY props_key, driver_key;
+    WCHAR driver[MAX_PATH];
+    DWORD driver_len = sizeof(driver);
 
     if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
     else buffer[count - 1] = DEVPKEY_Device_InstanceId;
@@ -855,6 +888,21 @@ LSTATUS enum_device_property_keys( HKEY hkey, const struct device *dev, DEVPROPK
             if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
             else buffer[count - 1] = *desc->key;
         }
+    }
+
+    if (!RegQueryValueExW( hkey, L"Driver", NULL, NULL, (BYTE *)driver, &driver_len ) &&
+        !open_class_key( HKEY_LOCAL_MACHINE, driver, KEY_QUERY_VALUE, TRUE, &driver_key ))
+    {
+        for (UINT i = 0; i < ARRAY_SIZE(driver_properties); i++)
+        {
+            const struct property_desc *desc = driver_properties + i;
+            if (!RegQueryValueExW( driver_key, desc->name, NULL, NULL, NULL, NULL ))
+            {
+                if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
+                else buffer[count - 1] = *desc->key;
+            }
+        }
+        RegCloseKey( driver_key );
     }
 
     if (!open_key( hkey, L"Properties", KEY_ENUMERATE_SUB_KEYS, TRUE, &props_key ))
