@@ -2,6 +2,8 @@
 Signature="$CHICAGO$"
 ClassGuid={4d36e978-e325-11ce-bfc1-08002be10318}
 Class=Ports
+Provider="Wine"
+DriverVer=06/21/2006,10.0.26100.9278
 
 [Manufacturer]
 Wine=mfg_section
