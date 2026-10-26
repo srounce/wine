@@ -77,6 +77,7 @@ struct driver
     WCHAR mfg_key[LINE_LEN];
     WCHAR description[LINE_LEN];
     WCHAR section[LINE_LEN];
+    WCHAR matching_id[MAX_DEVICE_ID_LEN];
 };
 
 /* is used to identify if a DeviceInfoSet pointer is
@@ -4292,6 +4293,12 @@ BOOL WINAPI SetupDiGetDevicePropertyKeys( HDEVINFO devinfo, PSP_DEVINFO_DATA dev
     return !ret;
 }
 
+static BOOL is_driver_property( const DEVPROPKEY *key )
+{
+    return IsEqualGUID( &key->fmtid, &DEVPKEY_Device_DriverDate.fmtid ) &&
+           key->pid >= DEVPKEY_Device_DriverDate.pid && key->pid <= DEVPKEY_Device_DriverCoInstallers.pid;
+}
+
 static DWORD get_device_property( struct device *device, HDEVINFO devinfo, PSP_DEVINFO_DATA device_data,
                                   const DEVPROPKEY *prop_key, DEVPROPTYPE *prop_type, BYTE *buf, DWORD buf_size,
                                   DWORD *req_size, DWORD flags )
@@ -4382,9 +4389,10 @@ static DWORD get_device_property( struct device *device, HDEVINFO devinfo, PSP_D
     else if (IsEqualDevPropKey( *prop_key, DEVPKEY_Device_ContainerId ))
         ret = get_device_property( device, devinfo, device_data, &DEVPKEY_Device_BaseContainerId, prop_type, buf,
                                     buf_size, req_size, flags );
-    else if (IsEqualDevPropKey( *prop_key, DEVPKEY_Device_IsPresent ))
+    else if (IsEqualDevPropKey( *prop_key, DEVPKEY_Device_IsPresent ) || is_driver_property( prop_key ))
     {
-        /* Presence isn't stored with the device, cfgmgr32 computes it. */
+        /* Presence isn't stored with the device, cfgmgr32 computes it, and it also finds the driver properties of
+         * devices installed without them. */
         ULONG size = buf_size;
         CONFIGRET cr;
 
@@ -4546,7 +4554,7 @@ BOOL WINAPI SetupDiRegisterCoDeviceInstallers(HDEVINFO devinfo, SP_DEVINFO_DATA 
 /* Check whether the given hardware or compatible ID matches any of the device's
  * own hardware or compatible IDs. */
 static BOOL device_matches_id(const struct device *device, const WCHAR *id_type, const WCHAR *id,
-                              DWORD *driver_rank)
+                              DWORD *driver_rank, WCHAR *matching_id)
 {
     WCHAR *device_ids;
     const WCHAR *p;
@@ -4562,6 +4570,7 @@ static BOOL device_matches_id(const struct device *device, const WCHAR *id_type,
                 if (!wcsicmp(p, id))
                 {
                     *driver_rank += min(i, 0xff);
+                    lstrcpynW(matching_id, p, MAX_DEVICE_ID_LEN);
                     free(device_ids);
                     return TRUE;
                 }
@@ -4654,9 +4663,9 @@ static void enum_compat_drivers_from_file(struct device *device, const WCHAR *pa
             driver.rank = 0;
             for (k = 2, found = FALSE; SetupGetStringFieldW(&ctx, k, id, ARRAY_SIZE(id), NULL); ++k)
             {
-                if ((found = device_matches_id(device, L"HardwareId", id, &driver.rank))) break;
+                if ((found = device_matches_id(device, L"HardwareId", id, &driver.rank, driver.matching_id))) break;
                 driver.rank += 0x2000;
-                if ((found = device_matches_id(device, L"CompatibleIDs", id, &driver.rank))) break;
+                if ((found = device_matches_id(device, L"CompatibleIDs", id, &driver.rank, driver.matching_id))) break;
                 driver.rank = 0x1000 + min(0x0100 * (k - 2), 0xf00);
             }
 
@@ -4748,6 +4757,56 @@ BOOL WINAPI SetupDiBuildDriverInfoList(HDEVINFO devinfo, SP_DEVINFO_DATA *device
     return TRUE;
 }
 
+static BOOL parse_driver_date(const WCHAR *str, FILETIME *date)
+{
+    SYSTEMTIME time = {0};
+    WCHAR *end;
+
+    time.wMonth = wcstoul(str, &end, 10);
+    if (*end != '/' && *end != '-') return FALSE;
+    time.wDay = wcstoul(end + 1, &end, 10);
+    if (*end != '/' && *end != '-') return FALSE;
+    time.wYear = wcstoul(end + 1, &end, 10);
+    return !*end && SystemTimeToFileTime(&time, date);
+}
+
+static DWORDLONG parse_driver_version(const WCHAR *str)
+{
+    DWORDLONG version = 0;
+    WCHAR *end;
+    UINT i;
+
+    for (i = 0; i < 4; ++i)
+    {
+        if (*str < '0' || *str > '9') return 0;
+        version = version << 16 | (wcstoul(str, &end, 10) & 0xffff);
+        if (*end == '.') str = end + 1;
+        else if (!*end) return version << (16 * (3 - i));
+        else return 0;
+    }
+    return version;
+}
+
+/* DriverVer is a date as mm/dd/yyyy, and a version as w.x.y.z. Whatever is missing or invalid is zero, each on its
+ * own. A version of fewer than four parts is completed with zeros, and what follows the fourth part is ignored. */
+static void get_driver_version(HINF hinf, FILETIME *date, DWORDLONG *version)
+{
+    WCHAR str[LINE_LEN];
+    INFCONTEXT ctx;
+
+    date->dwLowDateTime = date->dwHighDateTime = 0;
+    *version = 0;
+
+    if (!SetupFindFirstLineW(hinf, L"Version", L"DriverVer", &ctx))
+        return;
+
+    if (!SetupGetStringFieldW(&ctx, 1, str, ARRAY_SIZE(str), NULL) || !parse_driver_date(str, date))
+        date->dwLowDateTime = date->dwHighDateTime = 0;
+
+    if (SetupGetStringFieldW(&ctx, 2, str, ARRAY_SIZE(str), NULL))
+        *version = parse_driver_version(str);
+}
+
 static BOOL copy_driver_data(SP_DRVINFO_DATA_W *data, const struct driver *driver)
 {
     INFCONTEXT ctx;
@@ -4759,6 +4818,7 @@ static BOOL copy_driver_data(SP_DRVINFO_DATA_W *data, const struct driver *drive
     data->ProviderName[0] = 0;
     if (SetupFindFirstLineW(hinf, L"Version", L"Provider", &ctx))
         SetupGetStringFieldW(&ctx, 1, data->ProviderName, ARRAY_SIZE(data->ProviderName), NULL);
+    get_driver_version(hinf, &data->DriverDate, &data->DriverVersion);
     wcscpy(data->Description, driver->description);
     wcscpy(data->MfgName, driver->manufacturer);
     data->DriverType = SPDIT_COMPATDRIVER;
@@ -4776,6 +4836,8 @@ static void driver_data_wtoa(SP_DRVINFO_DATA_A *a, const SP_DRVINFO_DATA_W *w)
     WideCharToMultiByte(CP_ACP, 0, w->Description, -1, a->Description, sizeof(a->Description), NULL, NULL);
     WideCharToMultiByte(CP_ACP, 0, w->MfgName, -1, a->MfgName, sizeof(a->MfgName), NULL, NULL);
     WideCharToMultiByte(CP_ACP, 0, w->ProviderName, -1, a->ProviderName, sizeof(a->ProviderName), NULL, NULL);
+    a->DriverDate = w->DriverDate;
+    a->DriverVersion = w->DriverVersion;
 }
 
 /***********************************************************************
@@ -5098,6 +5160,15 @@ BOOL WINAPI SetupDiInstallDriverFiles(HDEVINFO devinfo, SP_DEVINFO_DATA *device_
     return TRUE;
 }
 
+static void set_driver_string(struct device *device, HKEY driver_key, const WCHAR *name, const DEVPROPKEY *key,
+        const WCHAR *value)
+{
+    DWORD size = (lstrlenW(value) + 1) * sizeof(WCHAR);
+
+    RegSetValueExW(driver_key, name, 0, REG_SZ, (BYTE *)value, size);
+    set_device_reg_property(device->key, key, DEVPROP_TYPE_STRING, (BYTE *)value, size);
+}
+
 /***********************************************************************
  *              SetupDiInstallDevice (SETUPAPI.@)
  */
@@ -5108,6 +5179,7 @@ BOOL WINAPI SetupDiInstallDevice(HDEVINFO devinfo, SP_DEVINFO_DATA *device_data)
     UINT install_flags = SPINST_ALL;
     HKEY driver_key, device_key;
     SC_HANDLE manager, service;
+    SP_DRVINFO_DATA_W driver_data;
     WCHAR svc_name[LINE_LEN];
     struct device *device;
     struct driver *driver;
@@ -5196,10 +5268,37 @@ BOOL WINAPI SetupDiInstallDevice(HDEVINFO devinfo, SP_DEVINFO_DATA *device_data)
     SetupCopyOEMInfW(driver->inf_path, NULL, SPOST_NONE, 0, inf_path, ARRAY_SIZE(inf_path), NULL, &filepart);
     TRACE("Copied INF file %s to %s.\n", debugstr_w(driver->inf_path), debugstr_w(inf_path));
 
-    RegSetValueExW(driver_key, L"InfPath", 0, REG_SZ, (BYTE *)filepart, lstrlenW(filepart) * sizeof(WCHAR));
-    RegSetValueExW(driver_key, L"InfSection", 0, REG_SZ, (BYTE *)driver->section, lstrlenW(driver->section) * sizeof(WCHAR));
+    set_driver_string(device, driver_key, L"InfPath", &DEVPKEY_Device_DriverInfPath, filepart);
+    set_driver_string(device, driver_key, L"InfSection", &DEVPKEY_Device_DriverInfSection, driver->section);
     if (extptr)
-        RegSetValueExW(driver_key, L"InfSectionExt", 0, REG_SZ, (BYTE *)extptr, lstrlenW(extptr) * sizeof(WCHAR));
+        set_driver_string(device, driver_key, L"InfSectionExt", &DEVPKEY_Device_DriverInfSectionExt, extptr);
+    else
+    {
+        /* the value of the previous driver of the device isn't the one of this driver */
+        RegDeleteValueW(driver_key, L"InfSectionExt");
+        set_device_reg_property(device->key, &DEVPKEY_Device_DriverInfSectionExt, DEVPROP_TYPE_EMPTY, NULL, 0);
+    }
+    set_driver_string(device, driver_key, L"DriverDesc", &DEVPKEY_Device_DriverDesc, driver->description);
+    set_driver_string(device, driver_key, L"MatchingDeviceId", &DEVPKEY_Device_MatchingDeviceId, driver->matching_id);
+    if (copy_driver_data(&driver_data, driver))
+    {
+        FILETIME *date = &driver_data.DriverDate;
+        SYSTEMTIME time;
+        WCHAR str[32];
+
+        set_driver_string(device, driver_key, L"ProviderName", &DEVPKEY_Device_DriverProvider, driver_data.ProviderName);
+
+        swprintf(str, ARRAY_SIZE(str), L"%I64u.%I64u.%I64u.%I64u", driver_data.DriverVersion >> 48,
+                (driver_data.DriverVersion >> 32) & 0xffff, (driver_data.DriverVersion >> 16) & 0xffff,
+                driver_data.DriverVersion & 0xffff);
+        set_driver_string(device, driver_key, L"DriverVersion", &DEVPKEY_Device_DriverVersion, str);
+
+        FileTimeToSystemTime(date, &time);
+        swprintf(str, ARRAY_SIZE(str), L"%u-%u-%u", time.wMonth, time.wDay, time.wYear);
+        RegSetValueExW(driver_key, L"DriverDate", 0, REG_SZ, (BYTE *)str, (lstrlenW(str) + 1) * sizeof(WCHAR));
+        RegSetValueExW(driver_key, L"DriverDateData", 0, REG_BINARY, (BYTE *)date, sizeof(*date));
+        set_device_reg_property(device->key, &DEVPKEY_Device_DriverDate, DEVPROP_TYPE_FILETIME, (BYTE *)date, sizeof(*date));
+    }
 
     RegCloseKey(device_key);
     RegCloseKey(driver_key);
