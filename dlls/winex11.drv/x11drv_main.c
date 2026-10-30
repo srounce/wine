@@ -81,6 +81,7 @@ BOOL shape_layered_windows = TRUE;
 int copy_default_colors = 128;
 int alloc_system_colors = 256;
 int xrender_error_base = 0;
+int xrandr_error_base = 0;
 char *process_name = NULL;
 pthread_key_t x11drv_thread_data_key = 0;
 
@@ -223,6 +224,23 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
         if (xrender_error_base)  /* check for XRender errors */
         {
             if (event->error_code == xrender_error_base + BadPicture) return TRUE;
+        }
+#endif
+#ifdef HAVE_X11_EXTENSIONS_XRANDR_H
+        if (xrandr_error_base)  /* check for XRandR errors */
+        {
+            /* Outputs, CRTCs and modes can disappear between enumeration and use,
+             * e.g. Xwayland removes them when a monitor is disabled. Every XRandR
+             * request in xrandr.c checks its result, so none of these are fatal.
+             * Unlike the window errors above they signal a real hardware or
+             * compositor event, so don't hide them at TRACE level. */
+            if (event->error_code >= xrandr_error_base &&
+                event->error_code < xrandr_error_base + RRNumberErrors)
+            {
+                WARN( "ignoring XRandR error %d req %d minor %d\n",
+                      event->error_code - xrandr_error_base, event->request_code, event->minor_code );
+                return TRUE;
+            }
         }
 #endif
     }

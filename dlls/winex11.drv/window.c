@@ -1796,6 +1796,64 @@ static void window_request_desired_state( struct x11drv_win_data *data )
 }
 
 /***********************************************************************
+ *      window_update_host_rect
+ *
+ * The virtual screen origin moved, and the host rects are virtual screen
+ * coordinates converted from X11 with whichever origin was current when their
+ * event was processed. Read the actual X11 position back so that the current
+ * rect is right in the new coordinates, and update the pending and desired
+ * rects too unless they hold a request that is still in flight or delayed.
+ */
+static void window_update_host_rect( struct x11drv_win_data *data )
+{
+    XWindowAttributes attr;
+    Window child;
+    POINT pos;
+    RECT rect;
+    int x, y, width, height;
+
+    if (!data->whole_window || data->embedded || data->whole_window == root_window) return;
+    /* the win32 rects of hidden and minimized windows are not where the WM put the X window */
+    if (data->desired_state.wm_state != NormalState) return;
+    if (!XGetWindowAttributes( data->display, data->whole_window, &attr )) return;
+    if (!XTranslateCoordinates( data->display, data->whole_window, root_window, 0, 0, &x, &y, &child )) return;
+
+    width = attr.width;
+    height = attr.height;
+    if (width == 1 && height == 1 && IsRectEmpty( &data->rects.window )) width = height = 0;
+    pos = root_to_virtual_screen( x, y );
+    SetRect( &rect, pos.x, pos.y, pos.x + width, pos.y + height );
+
+    TRACE( "window %p/%lx current rect %s -> %s\n", data->hwnd, data->whole_window,
+           wine_dbgstr_rect(&data->current_state.rect), wine_dbgstr_rect(&rect) );
+    if (!data->configure_serial)
+    {
+        if (EqualRect( &data->desired_state.rect, &data->pending_state.rect )) data->desired_state.rect = rect;
+        data->pending_state.rect = rect;
+    }
+    data->current_state.rect = rect;
+}
+
+
+/***********************************************************************
+ *      desktop_resized
+ *
+ * Called from the desktop window's thread while win32u applies the new
+ * virtual screen rect to the desktop window, before it refreshes the state
+ * of the other windows from their win32 rects. When the virtual screen origin
+ * moved, have every window update its host rects and sync its win32 rects
+ * from them first, as if the window manager had just configured it.
+ */
+static void desktop_resized( const RECT *old_rect, const RECT *new_rect )
+{
+    TRACE( "desktop rect %s -> %s\n", wine_dbgstr_rect(old_rect), wine_dbgstr_rect(new_rect) );
+    /* the X11 to virtual screen mapping only depends on the virtual screen origin */
+    if (old_rect->left == new_rect->left && old_rect->top == new_rect->top) return;
+    send_message_timeout( HWND_BROADCAST, WM_X11DRV_DESKTOP_RESIZED, 0, 0, SMTO_ABORTIFHUNG, 2000, NULL );
+}
+
+
+/***********************************************************************
  *      GetWindowStateUpdates   (X11DRV.@)
  */
 BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground )
@@ -3270,6 +3328,20 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct window_rects old_rects;
     BOOL is_managed, was_fullscreen, activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
 
+    /* win32u only refreshes the other windows when the virtual screen rect changed, which is
+     * also the only case where the X11 to virtual screen mapping can change */
+    if (hwnd == NtUserGetDesktopWindow())
+    {
+        static RECT desktop_rect;
+
+        if (!EqualRect( &desktop_rect, &new_rects->window ))
+        {
+            RECT old_rect = desktop_rect;
+            desktop_rect = new_rects->window;
+            if (!IsRectEmpty( &old_rect )) desktop_resized( &old_rect, &desktop_rect );
+        }
+    }
+
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
     if (!(data = get_win_data( hwnd ))) return;
@@ -3558,6 +3630,13 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         return 0;
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
+        return 0;
+    case WM_X11DRV_DESKTOP_RESIZED:
+        if (!(data = get_win_data( hwnd ))) return 0;
+        window_update_host_rect( data );
+        release_win_data( data );
+        /* sync the win32 rects with the usual checks, before win32u refreshes the window state */
+        send_message( hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
         return 0;
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );

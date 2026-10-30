@@ -384,69 +384,208 @@ BOOL X11DRV_DisplayDevices_SupportEventHandlers(void)
     return !!host_handler.register_event_handlers;
 }
 
-UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manager, void *param )
+struct device_source
 {
-    INT gpu_count, adapter_count, monitor_count, current_adapter_count = 0;
-    struct x11drv_adapter *adapters;
+    ULONG_PTR id;                 /* host adapter id, also used as the source name */
+    UINT state_flags;
     struct gdi_monitor *monitors;
-    struct x11drv_gpu *gpus;
-    INT gpu, adapter, monitor;
+    INT monitor_count;
+    DEVMODEW current_mode;
     struct x11drv_mode *modes;
     UINT mode_count;
+};
+
+struct device_gpu
+{
+    struct device_source *sources;
+    INT source_count;
+};
+
+/* Map a host adapter to a settings handler id, index is the position of the adapter across all GPUs */
+static BOOL get_adapter_settings_id( ULONG_PTR adapter_id, INT index, BOOL is_primary, x11drv_settings_id *id )
+{
+    WCHAR devname[32];
+    char buffer[32];
+
+    /* The adapter id can only be used directly when both handlers come from the same backend */
+    if (settings_handler.get_id_from_adapter && !strcmp( settings_handler.name, host_handler.name ))
+        return settings_handler.get_id_from_adapter( adapter_id, id );
+
+    snprintf( buffer, sizeof(buffer), "\\\\.\\DISPLAY%d", index + 1 );
+    asciiz_to_unicode( devname, buffer );
+    return settings_handler.get_id( devname, is_primary, id );
+}
+
+static void free_device_source( struct device_source *source )
+{
+    if (source->monitors) host_handler.free_monitors( source->monitors, source->monitor_count );
+    free( source->modes );
+    source->monitors = NULL;
+    source->modes = NULL;
+}
+
+/* Query everything that is needed to register an adapter, without registering anything yet */
+static BOOL get_device_source( const struct x11drv_adapter *adapter, INT index, struct device_source *source )
+{
+    BOOL is_primary = !!(adapter->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+    x11drv_settings_id settings_id;
+
+    memset( source, 0, sizeof(*source) );
+    source->id = adapter->id;
+    source->state_flags = adapter->state_flags;
+    source->current_mode.dmSize = sizeof(source->current_mode);
+
+    if (!host_handler.get_monitors( adapter->id, &source->monitors, &source->monitor_count ))
+    {
+        WARN( "Failed to get monitors of adapter %#lx, skipping it.\n", adapter->id );
+        return FALSE;
+    }
+    if (!get_adapter_settings_id( adapter->id, index, is_primary, &settings_id ))
+    {
+        WARN( "Failed to get settings id of adapter %#lx, skipping it.\n", adapter->id );
+        goto failed;
+    }
+    if (!settings_handler.get_current_mode( settings_id, &source->current_mode ))
+    {
+        WARN( "Failed to get current mode of adapter %#lx, skipping it.\n", adapter->id );
+        goto failed;
+    }
+    if (!settings_handler.get_modes( settings_id, EDS_ROTATEDMODE, &source->modes, &source->mode_count ) ||
+        !source->mode_count)
+    {
+        WARN( "Failed to get modes of adapter %#lx, skipping it.\n", adapter->id );
+        goto failed;
+    }
+
+    TRACE( "adapter %#lx, state_flags %#x, monitor count %d, mode count %u\n", adapter->id,
+           adapter->state_flags, source->monitor_count, source->mode_count );
+    return TRUE;
+
+failed:
+    free_device_source( source );
+    return FALSE;
+}
+
+UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manager, void *param )
+{
+    UINT dpi = NtUserGetSystemDpiForProcess( NULL ), status = STATUS_UNSUCCESSFUL;
+    INT gpu_count, gpu, source, index = 0, attached_count = 0;
+    BOOL has_primary = FALSE, need_primary = FALSE;
+    struct device_gpu *device_gpus = NULL;
+    struct x11drv_gpu *gpus;
 
     TRACE( "via %s\n", debugstr_a(host_handler.name) );
 
-    /* Initialize GPUs */
     if (!host_handler.get_gpus( &gpus, &gpu_count, TRUE )) return STATUS_UNSUCCESSFUL;
-    TRACE("GPU count: %d\n", gpu_count);
+    TRACE( "GPU count: %d\n", gpu_count );
+
+    if (gpu_count && !(device_gpus = calloc( gpu_count, sizeof(*device_gpus) ))) goto done;
+
+    /* Query the whole host state before registering anything. An adapter whose host resources
+     * vanish half-way through, e.g. an XRandR output that Xwayland removes while a monitor is
+     * switched, is then left out entirely instead of being registered without modes, which
+     * win32u would report as an active monitor with an empty rect. */
+    for (gpu = 0; gpu < gpu_count; gpu++)
+    {
+        struct x11drv_adapter *adapters;
+        INT adapter, adapter_count;
+
+        if (!host_handler.get_adapters( gpus[gpu].id, &adapters, &adapter_count ))
+        {
+            WARN( "Failed to get adapters of GPU %#lx, skipping it.\n", gpus[gpu].id );
+            continue;
+        }
+        TRACE( "GPU: %#lx %s, adapter count: %d\n", gpus[gpu].id, debugstr_a( gpus[gpu].name ), adapter_count );
+
+        if (adapter_count && !(device_gpus[gpu].sources = calloc( adapter_count, sizeof(*device_gpus[gpu].sources) )))
+        {
+            host_handler.free_adapters( adapters );
+            goto done;
+        }
+
+        for (adapter = 0; adapter < adapter_count; adapter++, index++)
+        {
+            struct device_source *src = &device_gpus[gpu].sources[device_gpus[gpu].source_count];
+            struct x11drv_adapter host_adapter = adapters[adapter];
+            BOOL is_primary = !!(host_adapter.state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+
+            /* The primary adapter could not be queried, make the next attached one primary so
+             * that the configuration keeps a primary display */
+            if (need_primary && (host_adapter.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+            {
+                WARN( "Primary adapter is unusable, making adapter %#lx primary instead.\n", host_adapter.id );
+                host_adapter.state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+                is_primary = TRUE;
+            }
+
+            if (!get_device_source( &host_adapter, index, src ))
+            {
+                if (is_primary) need_primary = TRUE;
+                continue;
+            }
+
+            if (is_primary)
+            {
+                has_primary = TRUE;
+                need_primary = FALSE;
+            }
+            if (src->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) attached_count++;
+            device_gpus[gpu].source_count++;
+        }
+
+        host_handler.free_adapters( adapters );
+    }
+
+    if (!attached_count)
+    {
+        /* Nothing is attached, e.g. Xwayland in the middle of a monitor switch. Fail before touching
+         * the device manager, so that win32u keeps the previous configuration instead of none. */
+        WARN( "No attached display device found, keeping the previous configuration.\n" );
+        goto done;
+    }
+
+    /* The host did not report a primary adapter, or the one it reported was unusable and no
+     * attached adapter followed it: use the first attached one */
+    for (gpu = 0; !has_primary && gpu < gpu_count; gpu++)
+    {
+        for (source = 0; !has_primary && source < device_gpus[gpu].source_count; source++)
+        {
+            struct device_source *src = &device_gpus[gpu].sources[source];
+            if (!(src->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            WARN( "No primary adapter reported, making adapter %#lx primary.\n", src->id );
+            src->state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+            has_primary = TRUE;
+        }
+    }
 
     for (gpu = 0; gpu < gpu_count; gpu++)
     {
         device_manager->add_gpu( gpus[gpu].name, &gpus[gpu].pci_id, &gpus[gpu].vulkan_uuid, param );
 
-        /* Initialize adapters */
-        if (!host_handler.get_adapters( gpus[gpu].id, &adapters, &adapter_count )) break;
-        TRACE( "GPU: %#lx %s, adapter count: %d\n", gpus[gpu].id, debugstr_a( gpus[gpu].name ), adapter_count );
-
-        for (adapter = 0; adapter < adapter_count; adapter++)
+        for (source = 0; source < device_gpus[gpu].source_count; source++)
         {
-            DEVMODEW current_mode = {.dmSize = sizeof(current_mode)};
-            WCHAR devname[32];
+            struct device_source *src = &device_gpus[gpu].sources[source];
             char buffer[32];
-            x11drv_settings_id settings_id;
-            BOOL is_primary = adapters[adapter].state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE;
-            UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+            INT monitor;
 
-            sprintf( buffer, "%04lx", adapters[adapter].id );
-            device_manager->add_source( buffer, adapters[adapter].state_flags, dpi, param );
-
-            if (!host_handler.get_monitors( adapters[adapter].id, &monitors, &monitor_count )) break;
-            TRACE("adapter: %#lx, monitor count: %d\n", adapters[adapter].id, monitor_count);
-
-            /* Initialize monitors */
-            for (monitor = 0; monitor < monitor_count; monitor++)
-                device_manager->add_monitor( &monitors[monitor], param );
-
-            host_handler.free_monitors( monitors, monitor_count );
-
-            /* Get the settings handler id for the adapter */
-            snprintf( buffer, sizeof(buffer), "\\\\.\\DISPLAY%d", current_adapter_count + adapter + 1 );
-            asciiz_to_unicode( devname, buffer );
-            if (!settings_handler.get_id( devname, is_primary, &settings_id )) break;
-
-            settings_handler.get_current_mode( settings_id, &current_mode );
-            if (settings_handler.get_modes( settings_id, EDS_ROTATEDMODE, &modes, &mode_count ))
-            {
-                strip_driver_extra( &modes->mode, mode_count );
-                device_manager->add_modes( &current_mode, mode_count, &modes->mode, param );
-                free( modes );
-            }
+            sprintf( buffer, "%04lx", src->id );
+            device_manager->add_source( buffer, src->state_flags, dpi, param );
+            for (monitor = 0; monitor < src->monitor_count; monitor++)
+                device_manager->add_monitor( &src->monitors[monitor], param );
+            strip_driver_extra( &src->modes->mode, src->mode_count );
+            device_manager->add_modes( &src->current_mode, src->mode_count, &src->modes->mode, param );
         }
-
-        current_adapter_count += adapter_count;
-        host_handler.free_adapters( adapters );
     }
+    status = STATUS_SUCCESS;
 
+done:
+    for (gpu = 0; device_gpus && gpu < gpu_count; gpu++)
+    {
+        for (source = 0; source < device_gpus[gpu].source_count; source++)
+            free_device_source( &device_gpus[gpu].sources[source] );
+        free( device_gpus[gpu].sources );
+    }
+    free( device_gpus );
     host_handler.free_gpus( gpus, gpu_count );
-    return STATUS_SUCCESS;
+    return status;
 }
