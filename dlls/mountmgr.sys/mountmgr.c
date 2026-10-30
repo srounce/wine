@@ -594,6 +594,9 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 
     driver->MajorFunction[IRP_MJ_CREATE] = mountmgr_create;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = mountmgr_ioctl;
+    /* bus driver of the USB serial ports, through the root device root\wine\mountmgr */
+    driver->MajorFunction[IRP_MJ_PNP] = serial_bus_pnp;
+    driver->DriverExtension->AddDevice = serial_bus_add_device;
 
     if (!(status = IoCreateDevice( driver, 0, &device_mount_point_manager, 0, 0, FALSE, &device )))
         status = IoCreateSymbolicLink( &object_mount_point_manager, &device_mount_point_manager );
@@ -627,6 +630,7 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 
     IoCreateDriver( &driver_serial, serial_driver_entry );
     IoCreateDriver( &driver_parallel, parallel_driver_entry );
+    CloseHandle( CreateThread( NULL, 0, port_watch_thread, NULL, 0, NULL ));
 
     return status;
 }

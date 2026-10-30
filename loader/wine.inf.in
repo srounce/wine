@@ -1244,10 +1244,12 @@ services,"@%11%\ws2_32.dll,-4"
 
 [InfFiles]
 input.inf,"@%12%\hidclass.sys,-1"
+mountmgr.inf,"@%12%\mountmgr.sys,-1"
 mouhid.inf,"@%12%\mouhid.sys,-1"
 winebth.inf,"@%12%\winebth.sys,-1"
 winebus.inf,"@%12%\winebus.sys,-1"
 winehid.inf,"@%12%\winehid.sys,-1"
+wineports.inf,"@%12%\mountmgr.sys,-2"
 wineusb.inf,"@%12%\wineusb.sys,-1"
 winusb.inf,"@%12%\winusb.sys,-1"
 winexinput.inf,"@%12%\winexinput.sys,-1"

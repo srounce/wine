@@ -1,0 +1,11 @@
+[Version]
+Signature="$CHICAGO$"
+ClassGuid={4d36e978-e325-11ce-bfc1-08002be10318}
+Class=Ports
+
+[Manufacturer]
+Wine=mfg_section
+
+; the ports need no function driver, their I/O goes through the Unix device
+[mfg_section]
+USB Serial Device=device_section,WINE\USBSERIAL

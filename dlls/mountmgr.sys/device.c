@@ -2055,115 +2055,321 @@ NTSTATUS WINAPI disk_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 }
 
 
-/* create a serial or parallel port */
-static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_path,
-                                const char *dosdevices_path, HKEY *windows_ports_key )
+/* serial or parallel port state, indexed by port number - 1 */
+struct port_slot
 {
-    const WCHAR *dos_name_format, *nt_name_format, *reg_value_format, *symlink_format, *default_device;
-    WCHAR dos_name[7], reg_value[256], nt_buffer[32], symlink_buffer[32];
-    UNICODE_STRING nt_name, symlink_name, default_name;
-    DEVICE_OBJECT *dev_obj;
-    NTSTATUS status;
+    DEVICE_OBJECT *dev_obj;       /* NT device, NULL if the port doesn't exist */
+    char          *unix_path;     /* Unix device the dosdevices symlink points to */
+    BOOL           user_defined;  /* port comes from Software\Wine\Ports */
+    WCHAR         *instance_id;   /* Enum\USB key of a detected USB serial port */
+    int            home;          /* number a USB serial port goes back to once it is free */
+    BOOL           not_usb;       /* detected serial port known not to be a USB device */
+};
+
+struct port_type
+{
+    const WCHAR *wine_prefix;
+    const char  *dosdev_format;
+    const WCHAR *nt_name_format;
+    const WCHAR *reg_value_format;
+    const WCHAR *symlink_format;
+    const WCHAR *default_device;
     const WCHAR *windows_ports_key_name;
-    struct set_dosdev_symlink_params params = { dosdevices_path, unix_path };
+    struct port_slot *slots;
+    char **detected;              /* Unix devices found, in detection order */
+};
 
-    /* create DOS device */
-    if (MOUNTMGR_CALL( set_dosdev_symlink, &params )) return FALSE;
+static struct port_slot serial_slots[MAX_PORTS];
+static struct port_slot parallel_slots[MAX_PORTS];
+static char *serial_detected[MAX_PORTS];
+static char *parallel_detected[MAX_PORTS];
 
-    if (driver == serial_driver)
-    {
-        dos_name_format = L"COM%u";
-        nt_name_format = L"\\Device\\Serial%u";
-        reg_value_format = L"COM%u";
-        symlink_format = L"\\DosDevices\\COM%u";
-        default_device = L"\\DosDevices\\AUX";
-        windows_ports_key_name = L"HARDWARE\\DEVICEMAP\\SERIALCOMM";
-    }
+static const struct port_type serial_type =
+{
+    L"COM", "com%u", L"\\Device\\Serial%u", L"COM%u", L"\\DosDevices\\COM%u",
+    L"\\DosDevices\\AUX", L"HARDWARE\\DEVICEMAP\\SERIALCOMM", serial_slots,
+    serial_detected
+};
+
+static const struct port_type parallel_type =
+{
+    L"LPT", "lpt%u", L"\\Device\\Parallel%u", L"\\DosDevices\\LPT%u", L"\\DosDevices\\LPT%u",
+    L"\\DosDevices\\PRN", L"HARDWARE\\DEVICEMAP\\PARALLEL PORTS", parallel_slots,
+    parallel_detected
+};
+
+static CRITICAL_SECTION port_section;
+static CRITICAL_SECTION_DEBUG port_critsect_debug =
+{
+    0, 0, &port_section,
+    { &port_critsect_debug.ProcessLocksList, &port_critsect_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": port_section") }
+};
+static CRITICAL_SECTION port_section = { &port_critsect_debug, -1, 0, 0, 0, 0 };
+
+static const struct port_type *get_port_type( DRIVER_OBJECT *driver )
+{
+    if (driver == serial_driver) return &serial_type;
+    assert( driver == parallel_driver );
+    return &parallel_type;
+}
+
+#define ENUM_USB_KEY L"System\\CurrentControlSet\\Enum\\USB"
+static const WCHAR ports_class_guid[] = L"{4D36E978-E325-11CE-BFC1-08002BE10318}";
+
+/* get the USB identity of a serial port; STATUS_NOT_SUPPORTED if it isn't a USB device,
+ * other errors if it couldn't be read */
+static NTSTATUS get_usb_port_info( const char *unix_path, struct serial_port_info *info )
+{
+    NTSTATUS status;
+
+    memset( info, 0, sizeof(*info) );
+    info->unix_path = unix_path;
+    if (!(status = MOUNTMGR_CALL( get_serial_port_info, info )) && !info->usb) status = STATUS_NOT_SUPPORTED;
+    return status;
+}
+
+/* check whether a USB serial number can make up an instance ID */
+static BOOL is_valid_usb_serial( const char *serial )
+{
+    const char *p;
+
+    /* Windows only uses serial numbers made of printable ASCII without commas */
+    if (!*serial) return FALSE;
+    for (p = serial; *p; p++)
+        if (*p <= ' ' || *p > '~' || *p == ',' || *p == '\\' || *p == '&') return FALSE;
+    return TRUE;
+}
+
+/* build the device instance ID of a USB serial port, relative to Enum\USB */
+static void get_usb_instance_id( const struct serial_port_info *info, WCHAR *id, size_t len )
+{
+    /* the ports of one interface share the device's serial number, and the interfaces of a
+     * composite device leave it to their parent */
+    BOOL use_serial = !info->composite && !info->multi_port && is_valid_usb_serial( info->serial );
+    unsigned int hash = 2166136261u;
+    const char *p;
+    int pos;
+
+    pos = swprintf( id, len, L"VID_%04X&PID_%04X", info->vid, info->pid );
+    if (info->composite) pos += swprintf( id + pos, len - pos, L"&MI_%02X", info->interface );
+    if (use_serial) swprintf( id + pos, len - pos, L"\\%hs", info->serial );
+    /* a generated ID contains '&', so that it isn't taken for a serial number; like the ID that
+     * Windows derives from the parent device, it follows the device to another USB port if the
+     * device has a serial number, and is tied to the USB port otherwise */
     else
     {
-        assert( driver == parallel_driver );
-        dos_name_format = L"LPT%u";
-        nt_name_format = L"\\Device\\Parallel%u";
-        reg_value_format = L"\\DosDevices\\LPT%u";
-        symlink_format = L"\\DosDevices\\LPT%u";
-        default_device = L"\\DosDevices\\PRN";
-        windows_ports_key_name = L"HARDWARE\\DEVICEMAP\\PARALLEL PORTS";
+        if (!is_valid_usb_serial( info->serial ))
+            pos += swprintf( id + pos, len - pos, L"\\7&wine&%hs&%u", info->location, info->interface );
+        else
+        {
+            /* FNV-1 hash of the device, as the PnP manager does for the parent ID prefix */
+            hash = (hash * 16777619) ^ info->vid;
+            hash = (hash * 16777619) ^ info->pid;
+            for (p = info->serial; *p; p++) hash = (hash * 16777619) ^ (unsigned char)*p;
+            pos += swprintf( id + pos, len - pos, L"\\7&wine&%08x&%u", hash, info->interface );
+        }
+        if (info->multi_port) swprintf( id + pos, len - pos, L"&%u", info->port );
+    }
+}
+
+/* build the instance ID of the composite device a USB serial port belongs to, relative to
+ * Enum\USB; applications such as those using Qt find the serial number there */
+static void get_usb_parent_id( const struct serial_port_info *info, WCHAR *id, size_t len )
+{
+    int pos = swprintf( id, len, L"VID_%04X&PID_%04X", info->vid, info->pid );
+
+    if (is_valid_usb_serial( info->serial )) swprintf( id + pos, len - pos, L"\\%hs", info->serial );
+    else swprintf( id + pos, len - pos, L"\\7&wine&%hs", info->location );
+}
+
+/* get the COM port number remembered for a USB serial port, 0 if none */
+static int get_usb_port_number( HKEY usb_key, const WCHAR *id )
+{
+    WCHAR path[MAX_PATH], name[16];
+    DWORD home, size = sizeof(home);
+    int n;
+
+    /* the port may sit elsewhere while a user-defined port has its number */
+    if (!RegGetValueW( usb_key, id, L"WinePortNumber", RRF_RT_REG_DWORD, NULL, &home, &size ))
+        return home >= 1 && home <= MAX_PORTS ? home : 0;
+
+    size = sizeof(name);
+    swprintf( path, ARRAY_SIZE(path), L"%s\\Device Parameters", id );
+    if (RegGetValueW( usb_key, path, L"PortName", RRF_RT_REG_SZ, NULL, name, &size )) return 0;
+    if (wcsnicmp( name, L"COM", 3 )) return 0;
+    n = wcstol( name + 3, NULL, 10 );
+    return n >= 1 && n <= MAX_PORTS ? n : 0;
+}
+
+/* collect the COM port numbers remembered for USB serial ports, present or not; if hide is
+ * set, also mark the ports created by mountmgr as not present until they are detected again */
+static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL hide )
+{
+    WCHAR device[MAX_PATH], instance[MAX_PATH], id[MAX_PATH], class[40];
+    DWORD size, marker, one = 1;
+    HKEY usb_key, device_key, instance_key;
+    int i, j, n;
+
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, ENUM_USB_KEY, 0, KEY_READ | KEY_SET_VALUE, &usb_key )) return;
+
+    for (i = 0; !RegEnumKeyW( usb_key, i, device, ARRAY_SIZE(device) ); i++)
+    {
+        if (RegOpenKeyExW( usb_key, device, 0, KEY_ENUMERATE_SUB_KEYS, &device_key )) continue;
+        for (j = 0; !RegEnumKeyW( device_key, j, instance, ARRAY_SIZE(instance) ); j++)
+        {
+            if (RegOpenKeyExW( device_key, instance, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &instance_key ))
+                continue;
+            size = sizeof(class);
+            if (!RegGetValueW( instance_key, NULL, L"ClassGUID", RRF_RT_REG_SZ, NULL, class, &size ) &&
+                !wcsicmp( class, ports_class_guid ))
+            {
+                swprintf( id, ARRAY_SIZE(id), L"%s\\%s", device, instance );
+                if ((n = get_usb_port_number( usb_key, id ))) reserved[n - 1] = TRUE;
+            }
+
+            /* this includes the composite parents created for the ports */
+            size = sizeof(marker);
+            if (hide && !RegGetValueW( instance_key, NULL, L"WineSerialPort", RRF_RT_REG_DWORD, NULL,
+                                       &marker, &size ) && marker)
+                RegSetValueExW( instance_key, L"Phantom", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
+            RegCloseKey( instance_key );
+        }
+        RegCloseKey( device_key );
+    }
+    RegCloseKey( usb_key );
+}
+
+/* create or remove the dosdevices symlink of a port */
+static NTSTATUS set_port_dosdev_symlink( const struct port_type *type, int n, const char *unix_path )
+{
+    char dosdev[8];
+    struct set_dosdev_symlink_params params = { dosdev, unix_path };
+
+    sprintf( dosdev, type->dosdev_format, n );
+    return MOUNTMGR_CALL( set_dosdev_symlink, &params );
+}
+
+/* create a serial or parallel port */
+static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_path, BOOL user_defined,
+                                const WCHAR *instance_id )
+{
+    const struct port_type *type = get_port_type( driver );
+    struct port_slot *slot = &type->slots[n - 1];
+    WCHAR reg_value[256], nt_buffer[32], symlink_buffer[32];
+    UNICODE_STRING nt_name, symlink_name, default_name;
+    DEVICE_OBJECT *dev_obj;
+    HKEY windows_ports_key;
+    NTSTATUS status;
+    char *path_copy;
+
+    if (!(path_copy = strdup( unix_path ))) return FALSE;
+
+    /* create DOS device */
+    if (set_port_dosdev_symlink( type, n, unix_path ))
+    {
+        free( path_copy );
+        return FALSE;
     }
 
-    swprintf( dos_name, ARRAY_SIZE(dos_name), dos_name_format, n );
-
     /* create NT device */
-    swprintf( nt_buffer, ARRAY_SIZE(nt_buffer), nt_name_format, n - 1 );
+    swprintf( nt_buffer, ARRAY_SIZE(nt_buffer), type->nt_name_format, n - 1 );
     RtlInitUnicodeString( &nt_name, nt_buffer );
     status = IoCreateDevice( driver, 0, &nt_name, 0, 0, FALSE, &dev_obj );
     if (status != STATUS_SUCCESS)
     {
         FIXME( "IoCreateDevice %s got %lx\n", debugstr_w(nt_name.Buffer), status );
+        free( path_copy );
         return FALSE;
     }
-    swprintf( symlink_buffer, ARRAY_SIZE(symlink_buffer), symlink_format, n );
+    swprintf( symlink_buffer, ARRAY_SIZE(symlink_buffer), type->symlink_format, n );
     RtlInitUnicodeString( &symlink_name, symlink_buffer );
     IoCreateSymbolicLink( &symlink_name, &nt_name );
     if (n == 1)
     {
-        RtlInitUnicodeString( &default_name, default_device );
+        RtlInitUnicodeString( &default_name, type->default_device );
         IoCreateSymbolicLink( &default_name, &symlink_name );
     }
 
     /* TODO: store information about the Unix device in the NT device */
 
     /* create registry entry */
-    if (!*windows_ports_key)
-        RegCreateKeyExW( HKEY_LOCAL_MACHINE, windows_ports_key_name, 0, NULL, REG_OPTION_VOLATILE,
-                         KEY_ALL_ACCESS, NULL, windows_ports_key, NULL );
+    if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, type->windows_ports_key_name, 0, NULL, REG_OPTION_VOLATILE,
+                          KEY_ALL_ACCESS, NULL, &windows_ports_key, NULL ))
+    {
+        swprintf( reg_value, ARRAY_SIZE(reg_value), type->reg_value_format, n );
+        RegSetValueExW( windows_ports_key, nt_name.Buffer, 0, REG_SZ,
+                        (BYTE *)reg_value, (lstrlenW( reg_value ) + 1) * sizeof(WCHAR) );
+        RegCloseKey( windows_ports_key );
+    }
 
-    swprintf( reg_value, ARRAY_SIZE(reg_value), reg_value_format, n );
-    RegSetValueExW( *windows_ports_key, nt_name.Buffer, 0, REG_SZ,
-                    (BYTE *)reg_value, (lstrlenW( reg_value ) + 1) * sizeof(WCHAR) );
-
+    slot->dev_obj = dev_obj;
+    slot->unix_path = path_copy;
+    slot->user_defined = user_defined;
+    slot->instance_id = instance_id ? wcsdup( instance_id ) : NULL;
     return TRUE;
 }
 
-/* find and create serial or parallel ports */
-static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
+/* remove a serial or parallel port created by create_port_device */
+static void remove_port_device( DRIVER_OBJECT *driver, int n )
 {
-    const char *dosdev_fmt;
-    char dosdev[8];
-    HKEY wine_ports_key = NULL, windows_ports_key = NULL;
+    const struct port_type *type = get_port_type( driver );
+    struct port_slot *slot = &type->slots[n - 1];
+    WCHAR nt_buffer[32], symlink_buffer[32];
+    UNICODE_STRING symlink_name, default_name;
+    HKEY windows_ports_key;
+
+    TRACE( "removing %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(slot->unix_path) );
+
+    if (n == 1)
+    {
+        RtlInitUnicodeString( &default_name, type->default_device );
+        IoDeleteSymbolicLink( &default_name );
+    }
+    swprintf( symlink_buffer, ARRAY_SIZE(symlink_buffer), type->symlink_format, n );
+    RtlInitUnicodeString( &symlink_name, symlink_buffer );
+    IoDeleteSymbolicLink( &symlink_name );
+    IoDeleteDevice( slot->dev_obj );
+
+    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, type->windows_ports_key_name, 0, KEY_SET_VALUE, &windows_ports_key ))
+    {
+        swprintf( nt_buffer, ARRAY_SIZE(nt_buffer), type->nt_name_format, n - 1 );
+        RegDeleteValueW( windows_ports_key, nt_buffer );
+        RegCloseKey( windows_ports_key );
+    }
+
+    set_port_dosdev_symlink( type, n, NULL );
+
+    if (slot->instance_id) usb_serial_port_removed( slot->instance_id );
+
+    free( slot->unix_path );
+    free( slot->instance_id );
+    memset( slot, 0, sizeof(*slot) );
+}
+
+/* read the user-defined ports from HKLM\Software\Wine\Ports, indexed by port number - 1 */
+static void read_wine_ports( const struct port_type *type, char *unix_paths[MAX_PORTS] )
+{
+    HKEY wine_ports_key;
     char unix_path[256];
-    const WCHAR *port_prefix;
     WCHAR reg_value[256];
-    BOOL used[MAX_PORTS];
     WCHAR port[7];
-    DWORD port_len, type, size;
+    DWORD port_len, type_id, size;
     int i, n;
 
-    if (driver == serial_driver)
-    {
-        dosdev_fmt = "com%u";
-        port_prefix = L"COM";
-    }
-    else
-    {
-        dosdev_fmt = "lpt%u";
-        port_prefix = L"LPT";
-    }
+    memset( unix_paths, 0, MAX_PORTS * sizeof(*unix_paths) );
 
-    /* @@ Wine registry key: HKLM\Software\Wine\Ports */
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\Ports", 0, KEY_QUERY_VALUE, &wine_ports_key ))
+        return;
 
-    RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\Ports", 0, NULL, 0,
-                     KEY_QUERY_VALUE, NULL, &wine_ports_key, NULL );
-
-    /* add user-defined serial ports */
-    memset(used, 0, sizeof(used));
     for (i = 0; ; i++)
     {
         port_len = ARRAY_SIZE(port);
         size = sizeof(reg_value);
         if (RegEnumValueW( wine_ports_key, i, port, &port_len, NULL,
-                    &type, (BYTE*)reg_value, &size ) != ERROR_SUCCESS)
+                    &type_id, (BYTE*)reg_value, &size ) != ERROR_SUCCESS)
             break;
-        if (type != REG_SZ || wcsnicmp( port, port_prefix, 3 ))
+        if (type_id != REG_SZ || wcsnicmp( port, type->wine_prefix, 3 ))
             continue;
 
         n = wcstol( port + 3, NULL, 10 );
@@ -2174,23 +2380,310 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
                     unix_path, sizeof(unix_path), NULL, NULL))
             continue;
 
-        used[n - 1] = TRUE;
-        sprintf( dosdev, dosdev_fmt, n );
-        create_port_device( driver, n, unix_path, dosdev, &windows_ports_key );
-    }
-
-    /* look for ports in the usual places */
-
-    for (n = 1; *devices; n++, devices += strlen(devices) + 1)
-    {
-        while (n <= MAX_PORTS && used[n - 1]) n++;
-        if (n > MAX_PORTS) break;
-        sprintf( dosdev, dosdev_fmt, n );
-        create_port_device( driver, n, devices, dosdev, &windows_ports_key );
+        free( unix_paths[n - 1] );
+        unix_paths[n - 1] = strdup( unix_path );
     }
 
     RegCloseKey( wine_ports_key );
-    RegCloseKey( windows_ports_key );
+}
+
+/* replace the list of detected ports; port_section must be held */
+static void set_detected_ports( const struct port_type *type, const char *devices )
+{
+    int i;
+
+    for (i = 0; i < MAX_PORTS; i++)
+    {
+        free( type->detected[i] );
+        type->detected[i] = NULL;
+    }
+    for (i = 0; i < MAX_PORTS && *devices; i++, devices += strlen( devices ) + 1)
+        type->detected[i] = strdup( devices );
+}
+
+/* check that the device behind a detected port is still the one it was created for */
+static BOOL is_detected_port( const struct port_type *type, const struct port_slot *slot )
+{
+    struct serial_port_info info;
+    WCHAR id[MAX_PATH];
+    int i;
+
+    for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
+        if (!strcmp( slot->unix_path, type->detected[i] )) break;
+    if (i == MAX_PORTS || !type->detected[i]) return FALSE;
+    if (type != &serial_type || slot->not_usb) return TRUE;
+
+    /* a USB device may have been replaced by another one with the same Unix device; a failed
+     * lookup may only mean that sysfs isn't ready, so it doesn't take away a port in use */
+    if (get_usb_port_info( slot->unix_path, &info )) return TRUE;
+    get_usb_instance_id( &info, id, ARRAY_SIZE(id) );
+    return slot->instance_id && !wcscmp( slot->instance_id, id );
+}
+
+/* create the ports of the detected devices that have none, without moving the others;
+ * port_section must be held */
+static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PORTS] )
+{
+    const struct port_type *type = get_port_type( driver );
+    BOOL reserved[MAX_PORTS] = { 0 }, scanned = FALSE;
+    struct serial_port_info info;
+    struct port_slot *slot;
+    NTSTATUS status;
+    WCHAR id[MAX_PATH], parent_id[MAX_PATH];
+    HKEY usb_key;
+    int i, n, home;
+
+    for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
+    {
+        for (n = 1; n <= MAX_PORTS; n++)
+        {
+            slot = &type->slots[n - 1];
+            if (slot->dev_obj && !slot->user_defined && !strcmp( slot->unix_path, type->detected[i] ))
+                break;
+        }
+        if (n <= MAX_PORTS) continue;
+
+        /* keep the numbers of absent USB serial ports for when they come back, as Windows does */
+        if (type == &serial_type && !scanned)
+        {
+            scan_usb_port_entries( reserved, FALSE );
+            scanned = TRUE;
+        }
+
+        n = home = 0;
+        status = type == &serial_type ? get_usb_port_info( type->detected[i], &info ) : STATUS_NOT_SUPPORTED;
+        if (!status)
+        {
+            get_usb_instance_id( &info, id, ARRAY_SIZE(id) );
+            if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, ENUM_USB_KEY, 0, KEY_READ, &usb_key ))
+            {
+                home = get_usb_port_number( usb_key, id );
+                RegCloseKey( usb_key );
+            }
+            /* while a user-defined port has the number, the port waits elsewhere to go back to it;
+             * if another device took it while the port was absent, the port gets a new one */
+            if (home && !unix_paths[home - 1])
+            {
+                if (!type->slots[home - 1].dev_obj) n = home;
+                else home = 0;
+            }
+        }
+        if (!n)
+        {
+            for (n = 1; n <= MAX_PORTS; n++)
+                if (!type->slots[n - 1].dev_obj && !unix_paths[n - 1] && !reserved[n - 1]) break;
+            if (n > MAX_PORTS) break;
+        }
+        if (!home) home = n;
+
+        TRACE( "placing detected %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(type->detected[i]) );
+        if (!create_port_device( driver, n, type->detected[i], FALSE, status ? NULL : id )) continue;
+
+        slot = &type->slots[n - 1];
+        slot->not_usb = status == STATUS_NOT_SUPPORTED;
+        if (!status)
+        {
+            slot->home = home;
+            if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id) );
+            usb_serial_port_arrived( &info, id, info.composite ? parent_id : NULL, n, home );
+        }
+    }
+}
+
+/* find and create serial or parallel ports */
+static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
+{
+    const struct port_type *type = get_port_type( driver );
+    char *unix_paths[MAX_PORTS];
+    BOOL reserved[MAX_PORTS] = { 0 };
+    HKEY wine_ports_key;
+    int n;
+
+    /* @@ Wine registry key: HKLM\Software\Wine\Ports */
+
+    if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\Ports", 0, NULL, 0,
+                          KEY_QUERY_VALUE, NULL, &wine_ports_key, NULL ))
+        RegCloseKey( wine_ports_key );
+
+    read_wine_ports( type, unix_paths );
+
+    /* USB serial ports left over from a previous session are present only once detected */
+    if (type == &serial_type) scan_usb_port_entries( reserved, TRUE );
+
+    EnterCriticalSection( &port_section );
+
+    set_detected_ports( type, devices );
+
+    /* add user-defined serial ports */
+    for (n = 1; n <= MAX_PORTS; n++)
+        if (unix_paths[n - 1]) create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
+
+    /* add the ports found in the usual places */
+    place_detected_ports( driver, unix_paths );
+
+    LeaveCriticalSection( &port_section );
+
+    for (n = 0; n < MAX_PORTS; n++) free( unix_paths[n] );
+}
+
+/* bring the ports in line with HKLM\Software\Wine\Ports and, if given, the detected devices */
+static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
+{
+    const struct port_type *type;
+    char *unix_paths[MAX_PORTS];
+    struct port_slot *slot;
+    char *path_copy;
+    int n;
+
+    if (!driver) return;  /* the driver failed to load */
+    type = get_port_type( driver );
+
+    read_wine_ports( type, unix_paths );
+
+    EnterCriticalSection( &port_section );
+
+    if (devices) set_detected_ports( type, devices );
+
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        slot = &type->slots[n - 1];
+
+        if (unix_paths[n - 1])
+        {
+            if (slot->dev_obj && !slot->user_defined)
+            {
+                /* user-defined port replaces a detected one, as it would at startup;
+                 * the detected one moves to a free slot in place_detected_ports */
+                remove_port_device( driver, n );
+            }
+            if (!slot->dev_obj)
+            {
+                TRACE( "adding %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(unix_paths[n - 1]) );
+                create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
+            }
+            else if (strcmp( slot->unix_path, unix_paths[n - 1] ))
+            {
+                TRACE( "changing %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(unix_paths[n - 1]) );
+                if ((path_copy = strdup( unix_paths[n - 1] )) &&
+                    !set_port_dosdev_symlink( type, n, unix_paths[n - 1] ))
+                {
+                    free( slot->unix_path );
+                    slot->unix_path = path_copy;
+                }
+                else free( path_copy );
+            }
+        }
+        else if (slot->dev_obj && slot->user_defined)
+        {
+            /* only a USB serial port pushed aside from this number moves back into it, below */
+            remove_port_device( driver, n );
+        }
+        else if (slot->dev_obj && !is_detected_port( type, slot ))
+        {
+            /* the device is gone, or replaced by another one that gets its own port */
+            TRACE( "removing detected %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(slot->unix_path) );
+            remove_port_device( driver, n );
+        }
+    }
+
+    /* a USB serial port pushed aside by a user-defined port goes back to its number once it is
+     * free; it is removed here and placed there again */
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        slot = &type->slots[n - 1];
+        if (!slot->dev_obj || !slot->home || slot->home == n) continue;
+        if (type->slots[slot->home - 1].dev_obj || unix_paths[slot->home - 1]) continue;
+        TRACE( "moving %s%u back to %s%u\n", debugstr_w(type->wine_prefix), n,
+               debugstr_w(type->wine_prefix), slot->home );
+        remove_port_device( driver, n );
+    }
+
+    place_detected_ports( driver, unix_paths );
+
+    LeaveCriticalSection( &port_section );
+
+    for (n = 0; n < MAX_PORTS; n++) free( unix_paths[n] );
+}
+
+/* thread signaling its event when serial ports appear or disappear; it owns the event handle */
+static DWORD WINAPI port_hotplug_thread( void *arg )
+{
+    NTSTATUS status;
+
+    /* the first call only starts watching, the ports are rescanned after it to miss no change */
+    while (!(status = MOUNTMGR_CALL( wait_serial_ports, NULL ))) SetEvent( arg );
+    WARN( "not watching for serial port changes, status %#lx\n", status );
+    CloseHandle( arg );
+    return 0;
+}
+
+/* start watching for serial port changes, return the event signaled on a change or NULL */
+static HANDLE start_port_hotplug(void)
+{
+    HANDLE event, thread_event, thread;
+
+    if (!(event = CreateEventW( NULL, FALSE, FALSE, NULL ))) return NULL;
+    if (DuplicateHandle( GetCurrentProcess(), event, GetCurrentProcess(), &thread_event,
+                         0, FALSE, DUPLICATE_SAME_ACCESS ))
+    {
+        if ((thread = CreateThread( NULL, 0, port_hotplug_thread, thread_event, 0, NULL )))
+        {
+            CloseHandle( thread );
+            return event;
+        }
+        CloseHandle( thread_event );
+    }
+    WARN( "failed to start watching for serial port changes\n" );
+    CloseHandle( event );
+    return NULL;
+}
+
+/* thread watching HKLM\Software\Wine\Ports and the serial devices for changes */
+DWORD WINAPI port_watch_thread( void *arg )
+{
+    char devices[4096];
+    struct detect_ports_params params = { devices, sizeof(devices) };
+    HANDLE events[2];
+    DWORD count;
+    HKEY key;
+
+    /* watch the parent key, deleting the ports key only notifies its parent */
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine", 0, NULL, 0, KEY_NOTIFY, NULL, &key, NULL ))
+    {
+        ERR( "failed to open the Wine key, not watching for port changes\n" );
+        return 0;
+    }
+
+    if (!(events[0] = CreateEventW( NULL, FALSE, FALSE, NULL )))
+    {
+        ERR( "failed to create an event, not watching for port changes\n" );
+        RegCloseKey( key );
+        return 0;
+    }
+    /* without hotplug, still follow the registry */
+    count = (events[1] = start_port_hotplug()) ? 2 : 1;
+
+    for (;;)
+    {
+        if (RegNotifyChangeKeyValue( key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                                     events[0], TRUE ))
+        {
+            ERR( "failed to watch the Wine key\n" );
+            break;
+        }
+
+        /* sync after arming the notification so that no change is missed */
+        MOUNTMGR_CALL( detect_serial_ports, &params );
+        sync_port_devices( serial_driver, devices );
+        sync_port_devices( parallel_driver, NULL );
+
+        WaitForMultipleObjects( count, events, FALSE, INFINITE );
+    }
+
+    RegCloseKey( key );
+    CloseHandle( events[0] );
+    if (events[1]) CloseHandle( events[1] );
+    return 0;
 }
 
 /* driver entry point for the serial port driver */

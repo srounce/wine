@@ -14,4 +14,6 @@ SOURCES = \
 	device.c \
 	diskarb.c \
 	mountmgr.c \
+	mountmgr.rc \
+	pnp.c \
 	unixlib.c
