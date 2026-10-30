@@ -52,6 +52,7 @@ enum device_type
 extern NTSTATUS WINAPI disk_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
 extern NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
 extern NTSTATUS WINAPI parallel_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
+extern DWORD WINAPI port_watch_thread( void *arg );
 
 enum scsi_device_type
 {
