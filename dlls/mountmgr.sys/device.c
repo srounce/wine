@@ -2116,15 +2116,6 @@ static const struct port_type *get_port_type( DRIVER_OBJECT *driver )
 
 #define ENUM_USB_KEY L"System\\CurrentControlSet\\Enum\\USB"
 static const WCHAR ports_class_guid[] = L"{4D36E978-E325-11CE-BFC1-08002BE10318}";
-static const WCHAR usb_class_guid[] = L"{36FC9E60-C465-11CF-8056-444553540000}";
-/* DEVPKEY_Device_Parent, as cfgmgr32 stores device properties */
-#define PARENT_PROPERTY_KEY L"Properties\\{4340A6C5-93FA-4706-972C-7B648008A5A7}\\0008"
-#define DEVPROP_TYPE_STRING_REG 0xffff0012
-
-static void set_reg_string( HKEY key, const WCHAR *name, const WCHAR *value )
-{
-    RegSetValueExW( key, name, 0, REG_SZ, (const BYTE *)value, (wcslen( value ) + 1) * sizeof(WCHAR) );
-}
 
 /* get the USB identity of a serial port; STATUS_NOT_SUPPORTED if it isn't a USB device,
  * other errors if it couldn't be read */
@@ -2249,116 +2240,6 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL hide )
     RegCloseKey( usb_key );
 }
 
-/* create the Enum\USB entry of the composite device a USB serial port belongs to, and link the
- * port's entry to it */
-static void set_usb_parent_entry( HKEY port_key, const struct serial_port_info *info )
-{
-    WCHAR id[MAX_PATH], path[MAX_PATH], buffer[MAX_PATH];
-    HKEY key;
-    DWORD one = 1;
-    int len;
-
-    get_usb_parent_id( info, id, ARRAY_SIZE(id) );
-    swprintf( path, ARRAY_SIZE(path), ENUM_USB_KEY L"\\%s", id );
-    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL )) return;
-
-    set_reg_string( key, L"Class", L"USB" );
-    set_reg_string( key, L"ClassGUID", usb_class_guid );
-    set_reg_string( key, L"DeviceDesc", L"USB Composite Device" );
-    set_reg_string( key, L"Service", L"usbccgp" );
-    len = swprintf( buffer, ARRAY_SIZE(buffer) - 1, L"USB\\VID_%04X&PID_%04X", info->vid, info->pid );
-    buffer[len + 1] = 0;
-    RegSetValueExW( key, L"HardwareID", 0, REG_MULTI_SZ, (BYTE *)buffer, (len + 2) * sizeof(WCHAR) );
-    RegSetValueExW( key, L"WineSerialPort", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    RegDeleteValueW( key, L"Phantom" );
-    RegCloseKey( key );
-
-    swprintf( buffer, ARRAY_SIZE(buffer), L"USB\\%s", id );
-    if (RegCreateKeyExW( port_key, PARENT_PROPERTY_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )) return;
-    RegSetValueExW( key, NULL, 0, DEVPROP_TYPE_STRING_REG, (BYTE *)buffer, (wcslen( buffer ) + 1) * sizeof(WCHAR) );
-    RegCloseKey( key );
-}
-
-/* create or update the Enum\USB entry of a present USB serial port, so that SetupDi lists it */
-static void set_usb_port_entry( const WCHAR *id, const struct serial_port_info *info, int n, DWORD home )
-{
-    WCHAR path[MAX_PATH], product[128], buffer[256];
-    HKEY key, params_key;
-    DWORD zero = 0, one = 1;
-    const WCHAR *instance;
-    int len;
-
-    swprintf( path, ARRAY_SIZE(path), ENUM_USB_KEY L"\\%s", id );
-    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL )) return;
-
-    if (!info->product[0] ||
-        !MultiByteToWideChar( CP_UTF8, 0, info->product, -1, product, ARRAY_SIZE(product) ))
-        wcscpy( product, L"USB Serial Device" );
-
-    set_reg_string( key, L"Class", L"Ports" );
-    set_reg_string( key, L"ClassGUID", ports_class_guid );
-    set_reg_string( key, L"DeviceDesc", product );
-    swprintf( buffer, ARRAY_SIZE(buffer), L"%s (COM%u)", product, n );
-    set_reg_string( key, L"FriendlyName", buffer );
-    if (!info->manufacturer[0] ||
-        !MultiByteToWideChar( CP_UTF8, 0, info->manufacturer, -1, buffer, ARRAY_SIZE(buffer) ))
-        wcscpy( buffer, L"(Standard port types)" );
-    set_reg_string( key, L"Mfg", buffer );
-    set_reg_string( key, L"Service", L"usbser" );
-
-    /* the hardware ID is the device ID without the instance */
-    instance = wcschr( id, '\\' );
-    len = swprintf( buffer, ARRAY_SIZE(buffer) - 1, L"USB\\%.*s", (int)(instance - id), id );
-    buffer[len + 1] = 0;
-    RegSetValueExW( key, L"HardwareID", 0, REG_MULTI_SZ, (BYTE *)buffer, (len + 2) * sizeof(WCHAR) );
-
-    RegSetValueExW( key, L"ConfigFlags", 0, REG_DWORD, (BYTE *)&zero, sizeof(zero) );
-    RegSetValueExW( key, L"WineSerialPort", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    RegSetValueExW( key, L"WinePortNumber", 0, REG_DWORD, (BYTE *)&home, sizeof(home) );
-    RegDeleteValueW( key, L"Phantom" );
-
-    if (info->composite) set_usb_parent_entry( key, info );
-
-    if (!RegCreateKeyExW( key, L"Device Parameters", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &params_key, NULL ))
-    {
-        swprintf( buffer, ARRAY_SIZE(buffer), L"COM%u", n );
-        set_reg_string( params_key, L"PortName", buffer );
-        RegCloseKey( params_key );
-    }
-    RegCloseKey( key );
-}
-
-/* mark the Enum\USB entry of a USB serial port as not present, with the composite parent created
- * for it; another serial interface of the device would only go away with it when unplugged */
-static void hide_usb_port_entry( const WCHAR *id )
-{
-    WCHAR path[MAX_PATH], parent[MAX_PATH];
-    DWORD one = 1, marker, size = sizeof(parent) - sizeof(WCHAR);
-    HKEY key, prop_key;
-    LSTATUS err = ERROR_FILE_NOT_FOUND;
-
-    swprintf( path, ARRAY_SIZE(path), ENUM_USB_KEY L"\\%s", id );
-    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &key )) return;
-    RegSetValueExW( key, L"Phantom", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    /* the property type isn't a registry type, so RegGetValue would reject it */
-    if (!RegOpenKeyExW( key, PARENT_PROPERTY_KEY, 0, KEY_QUERY_VALUE, &prop_key ))
-    {
-        err = RegQueryValueExW( prop_key, NULL, NULL, NULL, (BYTE *)parent, &size );
-        RegCloseKey( prop_key );
-    }
-    RegCloseKey( key );
-
-    if (err) return;
-    parent[size / sizeof(WCHAR)] = 0;
-    if (wcsnicmp( parent, L"USB\\", 4 )) return;
-    swprintf( path, ARRAY_SIZE(path), ENUM_USB_KEY L"\\%s", parent + 4 );
-    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key )) return;
-    size = sizeof(marker);
-    if (!RegGetValueW( key, NULL, L"WineSerialPort", RRF_RT_REG_DWORD, NULL, &marker, &size ) && marker)
-        RegSetValueExW( key, L"Phantom", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    RegCloseKey( key );
-}
-
 /* create or remove the dosdevices symlink of a port */
 static NTSTATUS set_port_dosdev_symlink( const struct port_type *type, int n, const char *unix_path )
 {
@@ -2459,7 +2340,7 @@ static void remove_port_device( DRIVER_OBJECT *driver, int n )
 
     set_port_dosdev_symlink( type, n, NULL );
 
-    if (slot->instance_id) hide_usb_port_entry( slot->instance_id );
+    if (slot->instance_id) usb_serial_port_removed( slot->instance_id );
 
     free( slot->unix_path );
     free( slot->instance_id );
@@ -2548,7 +2429,7 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
     struct serial_port_info info;
     struct port_slot *slot;
     NTSTATUS status;
-    WCHAR id[MAX_PATH];
+    WCHAR id[MAX_PATH], parent_id[MAX_PATH];
     HKEY usb_key;
     int i, n, home;
 
@@ -2603,7 +2484,8 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
         if (!status)
         {
             slot->home = home;
-            set_usb_port_entry( id, &info, n, home );
+            if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id) );
+            usb_serial_port_arrived( &info, id, info.composite ? parent_id : NULL, n, home );
         }
     }
 }

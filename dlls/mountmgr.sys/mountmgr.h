@@ -54,6 +54,15 @@ extern NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRIN
 extern NTSTATUS WINAPI parallel_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
 extern DWORD WINAPI port_watch_thread( void *arg );
 
+/* PnP devices of the USB serial ports */
+
+struct serial_port_info;
+extern NTSTATUS WINAPI serial_bus_add_device( DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo );
+extern NTSTATUS WINAPI serial_bus_pnp( DEVICE_OBJECT *device, IRP *irp );
+extern void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *id,
+                                     const WCHAR *parent_id, int port, int home );
+extern void usb_serial_port_removed( const WCHAR *id );
+
 enum scsi_device_type
 {
     SCSI_DISK_PERIPHERAL = 0x00,

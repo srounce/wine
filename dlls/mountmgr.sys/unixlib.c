@@ -658,6 +658,9 @@ static NTSTATUS get_serial_port_info( void *args )
         {
             info->interface = strtoul( buffer, NULL, 16 );
             info->multi_port = count_interface_ports( path ) > 1;
+            info->if_class[0] = read_sysfs_hex( path, "bInterfaceClass" );
+            info->if_class[1] = read_sysfs_hex( path, "bInterfaceSubClass" );
+            info->if_class[2] = read_sysfs_hex( path, "bInterfaceProtocol" );
         }
         if (read_sysfs_string( path, "idVendor", buffer, sizeof(buffer) )) break;
         if (!(p = strrchr( path, '/' )) || p == path) return STATUS_NOT_SUPPORTED;
@@ -670,6 +673,10 @@ static NTSTATUS get_serial_port_info( void *args )
     info->vid = strtoul( buffer, NULL, 16 );
     if (!read_sysfs_string( path, "idProduct", buffer, sizeof(buffer) )) return STATUS_UNSUCCESSFUL;
     info->pid = strtoul( buffer, NULL, 16 );
+    info->revision = read_sysfs_hex( path, "bcdDevice" );
+    info->dev_class[0] = read_sysfs_hex( path, "bDeviceClass" );
+    info->dev_class[1] = read_sysfs_hex( path, "bDeviceSubClass" );
+    info->dev_class[2] = read_sysfs_hex( path, "bDeviceProtocol" );
     if (!read_sysfs_string( path, "serial", info->serial, sizeof(info->serial) )) info->serial[0] = 0;
     if (!read_sysfs_string( path, "product", info->product, sizeof(info->product) )) info->product[0] = 0;
     if (!read_sysfs_string( path, "manufacturer", info->manufacturer, sizeof(info->manufacturer) ))

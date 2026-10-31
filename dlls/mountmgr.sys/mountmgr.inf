@@ -1,0 +1,23 @@
+[Version]
+Signature="$CHICAGO$"
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Class=System
+
+[Manufacturer]
+Wine=mfg_section
+
+[mfg_section]
+Wine serial port bus=device_section,root\mountmgr
+
+[device_section.Services]
+AddService = MountMgr,0x2,svc_section
+
+; keep in line with MountMgrService in wine.inf
+[svc_section]
+Description="Device mounting service"
+DisplayName="Mount Manager"
+ServiceBinary="%12%\mountmgr.sys"
+ServiceType=1
+StartType=0
+ErrorControl=1
+LoadOrderGroup="System Bus Extender"

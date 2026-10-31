@@ -142,6 +142,9 @@ struct serial_port_info
     BOOL        usb;           /* out: the port belongs to a USB device */
     USHORT      vid;
     USHORT      pid;
+    USHORT      revision;      /* bcdDevice */
+    BYTE        dev_class[3];  /* class, subclass and protocol of the USB device */
+    BYTE        if_class[3];   /* class, subclass and protocol of the port's interface */
     int         interface;     /* USB interface number of the port */
     BOOL        composite;     /* the USB device has its interfaces enumerated separately */
     int         port;          /* number of the port within its USB interface */
