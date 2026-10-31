@@ -136,6 +136,22 @@ struct detect_ports_params
     ULONG size;
 };
 
+struct serial_port_info
+{
+    const char *unix_path;     /* in: Unix device of the port */
+    BOOL        usb;           /* out: the port belongs to a USB device */
+    USHORT      vid;
+    USHORT      pid;
+    int         interface;     /* USB interface number of the port */
+    BOOL        composite;     /* the USB device has its interfaces enumerated separately */
+    int         port;          /* number of the port within its USB interface */
+    BOOL        multi_port;    /* the USB interface has more than one port */
+    char        serial[128];
+    char        product[128];
+    char        manufacturer[128];
+    char        location[64];  /* sysfs name of the USB device, e.g. "3-1.4" */
+};
+
 struct set_shell_folder_params
 {
     const WCHAR *folder;
@@ -185,6 +201,8 @@ enum mountmgr_funcs
     unix_cdrom_ioctl,
     unix_detect_serial_ports,
     unix_detect_parallel_ports,
+    unix_get_serial_port_info,
+    unix_wait_serial_ports,
     unix_set_shell_folder,
     unix_get_shell_folder,
     unix_dhcp_request,

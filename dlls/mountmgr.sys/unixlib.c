@@ -24,8 +24,10 @@
 
 #include "config.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +41,11 @@
 #ifdef __APPLE__
 # include <CoreFoundation/CoreFoundation.h>
 # include <sys/param.h>
+#endif
+#ifdef HAVE_SYS_INOTIFY_H
+# include <sys/inotify.h>
+# include <poll.h>
+# include <time.h>
 #endif
 #include <unistd.h>
 
@@ -114,18 +121,45 @@ static BOOL is_valid_device( struct stat *st )
 #endif
 }
 
+static int compare_numbers( const void *a, const void *b )
+{
+    unsigned int x = *(const unsigned int *)a, y = *(const unsigned int *)b;
+    return x < y ? -1 : x > y;
+}
+
 static void detect_devices( const char **paths, char *names, ULONG size )
 {
     while (*paths)
     {
-        char unix_path[32];
-        unsigned int i = 0;
+        /* the paths end in "%u"; list the directory instead of probing numbers, so that
+         * neither a gap nor a high number left by a re-plugged USB device hides a port */
+        const char *prefix = strrchr( *paths, '/' ) + 1;
+        size_t prefix_len = strlen( prefix ) - 2;
+        unsigned int numbers[256], count = 0, i;
+        char unix_path[32], dir[32], *end;
+        struct dirent *entry;
+        DIR *d;
 
-        for (;;)
+        snprintf( dir, sizeof(dir), "%.*s", (int)(prefix - *paths), *paths );
+        if ((d = opendir( dir )))
         {
-            int len = snprintf( unix_path, sizeof(unix_path), *paths, i++ );
+            while (count < ARRAY_SIZE(numbers) && (entry = readdir( d )))
+            {
+                const char *num = entry->d_name + prefix_len;
+
+                if (strncmp( entry->d_name, prefix, prefix_len )) continue;
+                if (*num < '0' || *num > '9' || (*num == '0' && num[1])) continue;
+                numbers[count] = strtoul( num, &end, 10 );
+                if (!*end) count++;
+            }
+            closedir( d );
+        }
+        qsort( numbers, count, sizeof(*numbers), compare_numbers );
+
+        for (i = 0; i < count; i++)
+        {
+            int len = snprintf( unix_path, sizeof(unix_path), *paths, numbers[i] );
             if (len + 2 > size) break;
-            if (access( unix_path, F_OK ) != 0) break;
             strcpy( names, unix_path );
             names += len + 1;
             size -= len + 1;
@@ -531,6 +565,200 @@ static NTSTATUS detect_parallel_ports( void *args )
     return STATUS_SUCCESS;
 }
 
+#ifdef linux
+
+/* read a sysfs attribute without its trailing newline */
+static BOOL read_sysfs_string( const char *dir, const char *name, char *buffer, size_t size )
+{
+    char path[PATH_MAX];
+    ssize_t len;
+    int fd;
+
+    if (snprintf( path, sizeof(path), "%s/%s", dir, name ) >= sizeof(path)) return FALSE;
+    if ((fd = open( path, O_RDONLY )) == -1) return FALSE;
+    len = read( fd, buffer, size - 1 );
+    close( fd );
+    if (len < 0) return FALSE;
+    while (len && (buffer[len - 1] == '\n' || buffer[len - 1] == ' ')) len--;
+    buffer[len] = 0;
+    return len > 0;
+}
+
+/* count the serial ports of a USB interface directory */
+static int count_interface_ports( const char *dir )
+{
+    struct dirent *entry;
+    int count = 0;
+    DIR *d;
+
+    if (!(d = opendir( dir ))) return 0;
+    while ((entry = readdir( d )))
+    {
+        /* usb-serial ports have a directory each, an ACM interface has a single tty */
+        if (!strncmp( entry->d_name, "ttyUSB", 6 )) count++;
+        else if (!strcmp( entry->d_name, "tty" ) && !count) count = 1;
+    }
+    closedir( d );
+    return count;
+}
+
+/* read a hexadecimal sysfs attribute */
+static unsigned int read_sysfs_hex( const char *dir, const char *name )
+{
+    char buffer[16];
+
+    return read_sysfs_string( dir, name, buffer, sizeof(buffer) ) ? strtoul( buffer, NULL, 16 ) : 0;
+}
+
+/* check whether Windows would load the composite driver for a USB device, which then names
+ * each of its interfaces separately */
+static BOOL is_composite_device( const char *dir )
+{
+    unsigned int class = read_sysfs_hex( dir, "bDeviceClass" );
+
+    if (read_sysfs_hex( dir, "bNumInterfaces" ) < 2) return FALSE;
+    if (read_sysfs_hex( dir, "bNumConfigurations" ) != 1) return FALSE;
+    /* an interface-defined class, or interface association descriptors */
+    return !class || (class == 0xef && read_sysfs_hex( dir, "bDeviceSubClass" ) == 0x02 &&
+                      read_sysfs_hex( dir, "bDeviceProtocol" ) == 0x01);
+}
+
+#endif
+
+/* get the USB identity of a serial port; STATUS_NOT_SUPPORTED means it isn't a USB device,
+ * other errors that it couldn't be read */
+static NTSTATUS get_serial_port_info( void *args )
+{
+#ifdef linux
+    struct serial_port_info *info = args;
+    char path[PATH_MAX], dir[PATH_MAX], buffer[16];
+    const char *name;
+    char *p;
+    int i;
+
+    info->usb = FALSE;
+    info->interface = -1;
+    info->port = 0;
+    info->multi_port = FALSE;
+
+    /* the port may be given through a symlink, such as /dev/serial/by-id */
+    if (!realpath( info->unix_path, path )) return STATUS_NO_SUCH_DEVICE;
+    if (!(name = strrchr( path, '/' ))) return STATUS_NO_SUCH_DEVICE;
+    snprintf( dir, sizeof(dir), "/sys/class/tty/%s/device", name + 1 );
+    if (!realpath( dir, path )) return STATUS_NOT_SUPPORTED;
+
+    /* usb-serial ports know their number within the interface, ACM ports are alone in it */
+    if (read_sysfs_string( path, "port_number", buffer, sizeof(buffer) ))
+        info->port = strtoul( buffer, NULL, 10 );
+
+    /* walk up from the tty device to its USB interface and USB device */
+    for (i = 0; i < 4; i++)
+    {
+        if (info->interface == -1 && read_sysfs_string( path, "bInterfaceNumber", buffer, sizeof(buffer) ))
+        {
+            info->interface = strtoul( buffer, NULL, 16 );
+            info->multi_port = count_interface_ports( path ) > 1;
+        }
+        if (read_sysfs_string( path, "idVendor", buffer, sizeof(buffer) )) break;
+        if (!(p = strrchr( path, '/' )) || p == path) return STATUS_NOT_SUPPORTED;
+        *p = 0;
+    }
+    if (i == 4) return STATUS_NOT_SUPPORTED;
+    /* a USB serial port always sits on an interface */
+    if (info->interface == -1) return STATUS_UNSUCCESSFUL;
+
+    info->vid = strtoul( buffer, NULL, 16 );
+    if (!read_sysfs_string( path, "idProduct", buffer, sizeof(buffer) )) return STATUS_UNSUCCESSFUL;
+    info->pid = strtoul( buffer, NULL, 16 );
+    if (!read_sysfs_string( path, "serial", info->serial, sizeof(info->serial) )) info->serial[0] = 0;
+    if (!read_sysfs_string( path, "product", info->product, sizeof(info->product) )) info->product[0] = 0;
+    if (!read_sysfs_string( path, "manufacturer", info->manufacturer, sizeof(info->manufacturer) ))
+        info->manufacturer[0] = 0;
+
+    p = strrchr( path, '/' );
+    snprintf( info->location, sizeof(info->location), "%s", p + 1 );
+    info->composite = is_composite_device( path );
+    info->usb = TRUE;
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+#if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
+static BOOL is_serial_port_name( const char *name )
+{
+    return !strncmp( name, "ttyS", 4 ) || !strncmp( name, "ttyUSB", 6 ) || !strncmp( name, "ttyACM", 6 );
+}
+
+static LONGLONG get_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec * (LONGLONG)1000 + ts.tv_nsec / 1000000;
+}
+#endif
+
+/* wait until serial ports appear in or disappear from /dev; the first call only starts watching */
+static NTSTATUS wait_serial_ports( void *args )
+{
+#if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
+    static int fd = -1;
+    char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    const struct inotify_event *event;
+    struct pollfd pfd;
+    LONGLONG deadline = 0;
+    ssize_t len;
+    char *p;
+    int ret, timeout = -1;
+
+    if (fd == -1)
+    {
+        if ((fd = inotify_init1( IN_CLOEXEC )) == -1) return errno_to_status( errno );
+        if (inotify_add_watch( fd, "/dev", IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO ) == -1)
+        {
+            ret = errno;
+            close( fd );
+            fd = -1;
+            return errno_to_status( ret );
+        }
+        return STATUS_SUCCESS;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    for (;;)
+    {
+        /* once a port changed, let the burst of events settle for a while before reporting it;
+         * the wait doesn't restart, so a stream of other events can't hold the report back */
+        if (deadline && (timeout = deadline - get_monotonic_ms()) <= 0) return STATUS_SUCCESS;
+        ret = poll( &pfd, 1, timeout );
+        if (!ret) return STATUS_SUCCESS;
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;
+            return errno_to_status( errno );
+        }
+
+        if ((len = read( fd, buffer, sizeof(buffer) )) <= 0)
+        {
+            if (len < 0 && errno == EINTR) continue;
+            return len ? errno_to_status( errno ) : STATUS_UNSUCCESSFUL;
+        }
+        for (p = buffer; p < buffer + len; p += sizeof(*event) + event->len)
+        {
+            event = (const struct inotify_event *)p;
+            if (deadline) continue;
+            if ((event->mask & IN_Q_OVERFLOW) || (event->len && is_serial_port_name( event->name )))
+                deadline = get_monotonic_ms() + 100;
+        }
+    }
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
 static NTSTATUS set_shell_folder( void *args )
 {
     const struct set_shell_folder_params *params = args;
@@ -627,6 +855,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     cdrom_ioctl,
     detect_serial_ports,
     detect_parallel_ports,
+    get_serial_port_info,
+    wait_serial_ports,
     set_shell_folder,
     get_shell_folder,
     dhcp_request,

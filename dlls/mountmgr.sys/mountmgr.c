@@ -627,6 +627,7 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 
     IoCreateDriver( &driver_serial, serial_driver_entry );
     IoCreateDriver( &driver_parallel, parallel_driver_entry );
+    CloseHandle( CreateThread( NULL, 0, port_watch_thread, NULL, 0, NULL ));
 
     return status;
 }
