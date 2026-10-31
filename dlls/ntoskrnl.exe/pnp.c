@@ -1476,11 +1476,16 @@ NTSTATUS WINAPI IoRegisterDeviceInterface(DEVICE_OBJECT *device, const GUID *cla
             && !SetupDiOpenDeviceInfoW( set, device_instance_id, NULL, 0, &sp_device ))
     {
         ERR("Failed to create device %s, error %#lx.\n", debugstr_w(device_instance_id), GetLastError());
-        return GetLastError();
+        status = GetLastError();
+        SetupDiDestroyDeviceInfoList( set );
+        return status;
     }
 
     if (!SetupDiCreateDeviceInterfaceW( set, &sp_device, class_guid, refstr ? refstr->Buffer : NULL, 0, &sp_iface ))
+    {
+        SetupDiDestroyDeviceInfoList( set );
         return STATUS_UNSUCCESSFUL;
+    }
 
     /* setupapi mangles the case; construct the interface path manually. */
 
@@ -1529,6 +1534,7 @@ NTSTATUS WINAPI IoRegisterDeviceInterface(DEVICE_OBJECT *device, const GUID *cla
         RtlDuplicateUnicodeString( 1, &device_path, symbolic_link );
 
     RtlFreeUnicodeString( &device_path );
+    SetupDiDestroyDeviceInfoList( set );
 
     return status;
 }
