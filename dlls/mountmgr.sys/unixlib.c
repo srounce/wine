@@ -127,7 +127,8 @@ static int compare_numbers( const void *a, const void *b )
     return x < y ? -1 : x > y;
 }
 
-static void detect_devices( const char **paths, char *names, ULONG size )
+static void detect_devices( const char **paths, BOOL (*is_port)( const char *unix_path ),
+                            char *names, ULONG size )
 {
     while (*paths)
     {
@@ -160,6 +161,7 @@ static void detect_devices( const char **paths, char *names, ULONG size )
         {
             int len = snprintf( unix_path, sizeof(unix_path), *paths, numbers[i] );
             if (len + 2 > size) break;
+            if (is_port && !is_port( unix_path )) continue;
             strcpy( names, unix_path );
             names += len + 1;
             size -= len + 1;
@@ -529,6 +531,39 @@ static NTSTATUS check_device_access( void *args )
     return STATUS_SUCCESS;
 }
 
+#ifdef linux
+/* read a sysfs attribute without its trailing newline */
+static BOOL read_sysfs_string( const char *dir, const char *name, char *buffer, size_t size )
+{
+    char path[PATH_MAX];
+    ssize_t len;
+    int fd;
+
+    if (snprintf( path, sizeof(path), "%s/%s", dir, name ) >= sizeof(path)) return FALSE;
+    if ((fd = open( path, O_RDONLY )) == -1) return FALSE;
+    len = read( fd, buffer, size - 1 );
+    close( fd );
+    if (len < 0) return FALSE;
+    while (len && (buffer[len - 1] == '\n' || buffer[len - 1] == ' ')) len--;
+    buffer[len] = 0;
+    return len > 0;
+}
+
+#endif
+
+/* the 8250 driver creates nr_uarts ttyS devices, with or without an UART behind them; the empty
+ * ones have type 0 (PORT_UNKNOWN), they open and then fail with EIO */
+static BOOL is_serial_port( const char *unix_path )
+{
+#ifdef linux
+    char dir[64], type[16];
+
+    snprintf( dir, sizeof(dir), "/sys/class/tty/%s", strrchr( unix_path, '/' ) + 1 );
+    if (read_sysfs_string( dir, "type", type, sizeof(type) ) && !strcmp( type, "0" )) return FALSE;
+#endif
+    return TRUE;
+}
+
 static NTSTATUS detect_serial_ports( void *args )
 {
     const struct detect_ports_params *params = args;
@@ -546,7 +581,7 @@ static NTSTATUS detect_serial_ports( void *args )
         NULL
     };
 
-    detect_devices( paths, params->names, params->size );
+    detect_devices( paths, is_serial_port, params->names, params->size );
     return STATUS_SUCCESS;
 }
 
@@ -561,28 +596,11 @@ static NTSTATUS detect_parallel_ports( void *args )
         NULL
     };
 
-    detect_devices( paths, params->names, params->size );
+    detect_devices( paths, NULL, params->names, params->size );
     return STATUS_SUCCESS;
 }
 
 #ifdef linux
-
-/* read a sysfs attribute without its trailing newline */
-static BOOL read_sysfs_string( const char *dir, const char *name, char *buffer, size_t size )
-{
-    char path[PATH_MAX];
-    ssize_t len;
-    int fd;
-
-    if (snprintf( path, sizeof(path), "%s/%s", dir, name ) >= sizeof(path)) return FALSE;
-    if ((fd = open( path, O_RDONLY )) == -1) return FALSE;
-    len = read( fd, buffer, size - 1 );
-    close( fd );
-    if (len < 0) return FALSE;
-    while (len && (buffer[len - 1] == '\n' || buffer[len - 1] == ' ')) len--;
-    buffer[len] = 0;
-    return len > 0;
-}
 
 /* count the serial ports of a USB interface directory */
 static int count_interface_ports( const char *dir )
