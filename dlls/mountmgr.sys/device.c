@@ -2204,6 +2204,24 @@ static int get_usb_port_number( HKEY usb_key, const WCHAR *id )
     return n >= 1 && n <= MAX_PORTS ? n : 0;
 }
 
+/* the driver of a port installed by an older version has no version nor provider, and the INF has
+ * another name; the PnP manager installs a device without a driver when it reports the device */
+static void remove_old_port_driver( HKEY instance_key )
+{
+    WCHAR driver[64], inf[MAX_PATH], path[MAX_PATH];
+    DWORD size = sizeof(driver);
+
+    if (RegGetValueW( instance_key, NULL, L"Driver", RRF_RT_REG_SZ, NULL, driver, &size )) return;
+    swprintf( path, ARRAY_SIZE(path), L"System\\CurrentControlSet\\Control\\Class\\%s", driver );
+    size = sizeof(inf);
+    if (RegGetValueW( HKEY_LOCAL_MACHINE, path, L"InfPath", RRF_RT_REG_SZ, NULL, inf, &size ) ||
+        wcsicmp( inf, L"wineports.inf" ))
+        return;
+    TRACE( "removing the old driver %s\n", debugstr_w(driver) );
+    RegDeleteTreeW( HKEY_LOCAL_MACHINE, path );
+    RegDeleteValueW( instance_key, L"Driver" );
+}
+
 /* older versions had another name for usbser.inf; it matches the same ID, and with both of them
  * any of them may be chosen. While a prefix is being updated, the driver starts before usbser.inf
  * is there, and a device installed without the INF may get another driver for good, so the old
@@ -2227,9 +2245,9 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL update )
     WCHAR device[MAX_PATH], instance[MAX_PATH], id[MAX_PATH], class[40];
     DWORD size, marker;
     HKEY usb_key, device_key, instance_key;
+    BOOL new_inf = update && remove_old_port_inf();
     int i, j, n;
 
-    if (update) remove_old_port_inf();
     if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, ENUM_USB_KEY, 0, KEY_READ | KEY_SET_VALUE, &usb_key )) return;
 
     for (i = 0; !RegEnumKeyW( usb_key, i, device, ARRAY_SIZE(device) ); i++)
@@ -2252,7 +2270,10 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL update )
             size = sizeof(marker);
             if (update && !RegGetValueW( instance_key, NULL, L"WineSerialPort", RRF_RT_REG_DWORD, NULL,
                                          &marker, &size ) && marker)
+            {
                 RegDeleteValueW( instance_key, L"Phantom" );
+                if (new_inf) remove_old_port_driver( instance_key );
+            }
             RegCloseKey( instance_key );
         }
         RegCloseKey( device_key );
