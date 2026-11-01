@@ -564,24 +564,25 @@ static BOOL is_serial_port( const char *unix_path )
     return TRUE;
 }
 
+static const char *serial_port_paths[] =
+{
+#ifdef linux
+    "/dev/ttyS%u",
+    "/dev/ttyUSB%u",
+    "/dev/ttyACM%u",
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    "/dev/cuau%u",
+#elif defined(__DragonFly__)
+    "/dev/cuaa%u",
+#endif
+    NULL
+};
+
 static NTSTATUS detect_serial_ports( void *args )
 {
     const struct detect_ports_params *params = args;
-    static const char *paths[] =
-    {
-#ifdef linux
-        "/dev/ttyS%u",
-        "/dev/ttyUSB%u",
-        "/dev/ttyACM%u",
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-        "/dev/cuau%u",
-#elif defined(__DragonFly__)
-        "/dev/cuaa%u",
-#endif
-        NULL
-    };
 
-    detect_devices( paths, is_serial_port, params->names, params->size );
+    detect_devices( serial_port_paths, is_serial_port, params->names, params->size );
     return STATUS_SUCCESS;
 }
 
@@ -708,6 +709,58 @@ static NTSTATUS get_serial_port_info( void *args )
 #else
     return STATUS_NOT_SUPPORTED;
 #endif
+}
+
+static NTSTATUS get_port_device( void *args )
+{
+    const struct get_port_device_params *params = args;
+    struct stat st;
+
+    if (stat( params->unix_path, &st ) == -1) return STATUS_NO_SUCH_DEVICE;
+    *params->device = S_ISCHR( st.st_mode ) ? st.st_rdev : 0;
+    return STATUS_SUCCESS;
+}
+
+/* check whether a symlink is one that mountmgr creates for a serial port */
+static BOOL is_serial_port_link( const char *target )
+{
+    const char **paths;
+
+    if (!strncmp( target, "/dev/serial/", 12 )) return TRUE;
+    for (paths = serial_port_paths; *paths; paths++)
+    {
+        size_t len = strlen( *paths ) - 2;
+
+        if (!strncmp( target, *paths, len ) && target[len] && !target[len + strspn( target + len, "0123456789" )])
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static NTSTATUS get_port_links( void *args )
+{
+    struct get_port_links_params *params = args;
+    char *path, *name, target[PATH_MAX];
+    struct stat st, device_st;
+    BOOL has_device;
+    unsigned int n;
+    int len;
+
+    has_device = params->unix_path && !stat( params->unix_path, &device_st ) && S_ISCHR( device_st.st_mode );
+    if (!(path = get_dosdevices_path( "com256" ))) return STATUS_NO_MEMORY;
+    name = path + strlen( path ) - 6;
+    for (n = 0; n < MAX_PORTS; n++)
+    {
+        sprintf( name, "com%u", n + 1 );
+        if ((len = readlink( path, target, sizeof(target) - 1 )) == -1) continue;
+        target[len] = 0;
+        if (is_serial_port_link( target )) params->port_links[n / 8] |= 1 << (n % 8);
+        else params->other_links[n / 8] |= 1 << (n % 8);
+        if (has_device && !stat( path, &st ) && S_ISCHR( st.st_mode ) && st.st_rdev == device_st.st_rdev)
+            params->device_links[n / 8] |= 1 << (n % 8);
+    }
+    free( path );
+    return STATUS_SUCCESS;
 }
 
 #if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
@@ -881,6 +934,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     detect_serial_ports,
     detect_parallel_ports,
     get_serial_port_info,
+    get_port_device,
+    get_port_links,
     wait_serial_ports,
     set_shell_folder,
     get_shell_folder,
