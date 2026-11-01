@@ -2202,6 +2202,22 @@ static int get_usb_port_number( HKEY usb_key, const WCHAR *id )
     return n >= 1 && n <= MAX_PORTS ? n : 0;
 }
 
+/* older versions had another name for usbser.inf; it matches the same ID, and with both of them
+ * any of them may be chosen. While a prefix is being updated, the driver starts before usbser.inf
+ * is there, and a device installed without the INF may get another driver for good, so the old
+ * one stays until the next session; returns whether usbser.inf is there. */
+static BOOL remove_old_port_inf(void)
+{
+    WCHAR path[MAX_PATH];
+    UINT len = GetWindowsDirectoryW( path, ARRAY_SIZE(path) );
+
+    swprintf( path + len, ARRAY_SIZE(path) - len, L"\\inf\\usbser.inf" );
+    if (GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    swprintf( path + len, ARRAY_SIZE(path) - len, L"\\inf\\wineports.inf" );
+    DeleteFileW( path );
+    return TRUE;
+}
+
 /* collect the COM port numbers remembered for USB serial ports, present or not; if update is
  * set, also bring the entries created by older versions up to date */
 static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL update )
@@ -2211,6 +2227,7 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL update )
     HKEY usb_key, device_key, instance_key;
     int i, j, n;
 
+    if (update) remove_old_port_inf();
     if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, ENUM_USB_KEY, 0, KEY_READ | KEY_SET_VALUE, &usb_key )) return;
 
     for (i = 0; !RegEnumKeyW( usb_key, i, device, ARRAY_SIZE(device) ); i++)

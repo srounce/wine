@@ -19,5 +19,5 @@
 /* @makedep: mountmgr.inf */
 1 WINE_DATA_FILE mountmgr.inf
 
-/* @makedep: wineports.inf */
-2 WINE_DATA_FILE wineports.inf
+/* @makedep: usbser.inf */
+2 WINE_DATA_FILE usbser.inf
