@@ -2202,12 +2202,12 @@ static int get_usb_port_number( HKEY usb_key, const WCHAR *id )
     return n >= 1 && n <= MAX_PORTS ? n : 0;
 }
 
-/* collect the COM port numbers remembered for USB serial ports, present or not; if hide is
- * set, also mark the ports created by mountmgr as not present until they are detected again */
-static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL hide )
+/* collect the COM port numbers remembered for USB serial ports, present or not; if update is
+ * set, also bring the entries created by older versions up to date */
+static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL update )
 {
     WCHAR device[MAX_PATH], instance[MAX_PATH], id[MAX_PATH], class[40];
-    DWORD size, marker, one = 1;
+    DWORD size, marker;
     HKEY usb_key, device_key, instance_key;
     int i, j, n;
 
@@ -2228,11 +2228,12 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL hide )
                 if ((n = get_usb_port_number( usb_key, id ))) reserved[n - 1] = TRUE;
             }
 
-            /* this includes the composite parents created for the ports */
+            /* this includes the composite parents created for the ports; a device is present
+             * while the PnP manager has it, Phantom would hide it from SetupDiOpenDeviceInfo */
             size = sizeof(marker);
-            if (hide && !RegGetValueW( instance_key, NULL, L"WineSerialPort", RRF_RT_REG_DWORD, NULL,
-                                       &marker, &size ) && marker)
-                RegSetValueExW( instance_key, L"Phantom", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
+            if (update && !RegGetValueW( instance_key, NULL, L"WineSerialPort", RRF_RT_REG_DWORD, NULL,
+                                         &marker, &size ) && marker)
+                RegDeleteValueW( instance_key, L"Phantom" );
             RegCloseKey( instance_key );
         }
         RegCloseKey( device_key );
@@ -2694,7 +2695,6 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
     read_wine_ports( type, unix_paths );
 
-    /* USB serial ports left over from a previous session are present only once detected */
     if (type == &serial_type) scan_usb_port_entries( reserved, TRUE );
 
     EnterCriticalSection( &port_section );

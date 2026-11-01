@@ -213,10 +213,8 @@ static HKEY open_enum_key( const struct usb_node *node, REGSAM access )
     return RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, access, &key ) ? NULL : key;
 }
 
-/* mark the Enum entry of a node as present or not; Wine has no other way to tell that a device is
- * gone, and the PnP manager can't open an entry marked phantom, so it is cleared before the node
- * is reported */
-static void set_node_present( const struct usb_node *node, BOOL present )
+/* mark the Enum entry of a node as created by mountmgr */
+static void mark_node( const struct usb_node *node )
 {
     WCHAR service[16];
     DWORD one = 1, size = sizeof(service);
@@ -224,15 +222,10 @@ static void set_node_present( const struct usb_node *node, BOOL present )
 
     if (!(key = open_enum_key( node, KEY_QUERY_VALUE | KEY_SET_VALUE ))) return;
     RegSetValueExW( key, L"WineSerialPort", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    if (!present) RegSetValueExW( key, L"Phantom", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
-    else
-    {
-        RegDeleteValueW( key, L"Phantom" );
-        /* entries written before the ports were PnP devices name a driver that doesn't exist */
-        if (!RegGetValueW( key, NULL, L"Service", RRF_RT_REG_SZ, NULL, service, &size ) &&
-            !wcsicmp( service, node->composite ? L"usbccgp" : L"usbser" ))
-            RegDeleteValueW( key, L"Service" );
-    }
+    /* entries written before the ports were PnP devices name a driver that doesn't exist */
+    if (!RegGetValueW( key, NULL, L"Service", RRF_RT_REG_SZ, NULL, service, &size ) &&
+        !wcsicmp( service, node->composite ? L"usbccgp" : L"usbser" ))
+        RegDeleteValueW( key, L"Service" );
     RegCloseKey( key );
 }
 
@@ -292,11 +285,11 @@ void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *
     node->present = 1;
     node->port = port;
     node->home = home;
-    set_node_present( node, TRUE );
+    mark_node( node );
     /* the bus reports a composite device once one of its ports is present */
     if (parent && !parent->present++)
     {
-        set_node_present( parent, TRUE );
+        mark_node( parent );
         invalidate_bus();
     }
     invalidate_parent( node );
@@ -316,13 +309,8 @@ void usb_serial_port_removed( const WCHAR *id )
     {
         TRACE( "%s\\%s removed\n", debugstr_w(node->device_id), debugstr_w(node->instance_id) );
         node->present = 0;
-        set_node_present( node, FALSE );
         /* removing a composite device removes its ports along with it */
-        if ((parent = node->parent) && !--parent->present)
-        {
-            set_node_present( parent, FALSE );
-            invalidate_bus();
-        }
+        if ((parent = node->parent) && !--parent->present) invalidate_bus();
         invalidate_parent( node );
         if (!node->pdo) free_usb_node( node );
     }
@@ -497,8 +485,8 @@ static NTSTATUS pdo_pnp( DEVICE_OBJECT *device, IRP *irp )
     case IRP_MN_START_DEVICE:
         if (composite)
         {
-            /* marked so that it is hidden when mountmgr starts, along with the ports */
-            set_node_present( node, TRUE );
+            /* the entry of a new composite device is created after it arrived, it is marked here */
+            mark_node( node );
             EnterCriticalSection( &pnp_cs );
             node->started = TRUE;
             IoInvalidateDeviceRelations( device, BusRelations );
