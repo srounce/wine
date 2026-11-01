@@ -152,6 +152,11 @@ struct get_port_links_params
     BYTE        other_links[MAX_PORTS / 8];  /* out: comN symlinks to anything else */
 };
 
+struct watch_port_targets_params
+{
+    const char *paths;  /* targets of the user-defined ports, each null-terminated, then an empty one */
+};
+
 struct serial_port_info
 {
     const char *unix_path;     /* in: Unix device of the port */
@@ -224,6 +229,7 @@ enum mountmgr_funcs
     unix_get_port_device,
     unix_get_port_links,
     unix_wait_serial_ports,
+    unix_watch_port_targets,
     unix_set_shell_folder,
     unix_get_shell_folder,
     unix_dhcp_request,

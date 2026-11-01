@@ -45,6 +45,7 @@
 #ifdef HAVE_SYS_INOTIFY_H
 # include <sys/inotify.h>
 # include <poll.h>
+# include <pthread.h>
 # include <time.h>
 #endif
 #include <unistd.h>
@@ -769,6 +770,27 @@ static BOOL is_serial_port_name( const char *name )
     return !strncmp( name, "ttyS", 4 ) || !strncmp( name, "ttyUSB", 6 ) || !strncmp( name, "ttyACM", 6 );
 }
 
+/* the inotify descriptor and the targets of the user-defined ports, which may be anywhere */
+static int port_watch_fd = -1;
+static char *port_targets;
+static pthread_mutex_t port_targets_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* check whether a name is a part of the path of a user-defined port; a device directory such as
+ * /dev/serial/by-id comes and goes along with the devices */
+static BOOL is_port_target_name( const char *name )
+{
+    size_t len = strlen( name );
+    const char *path, *p;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &port_targets_mutex );
+    for (path = port_targets; path && *path && !ret; path += strlen( path ) + 1)
+        for (p = path; !ret && (p = strstr( p, name )); p += len)
+            ret = p > path && p[-1] == '/' && (!p[len] || p[len] == '/');
+    pthread_mutex_unlock( &port_targets_mutex );
+    return ret;
+}
+
 static LONGLONG get_monotonic_ms(void)
 {
     struct timespec ts;
@@ -782,7 +804,7 @@ static LONGLONG get_monotonic_ms(void)
 static NTSTATUS wait_serial_ports( void *args )
 {
 #if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
-    static int fd = -1;
+    int fd = port_watch_fd;
     char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
     const struct inotify_event *event;
     struct pollfd pfd;
@@ -798,9 +820,9 @@ static NTSTATUS wait_serial_ports( void *args )
         {
             ret = errno;
             close( fd );
-            fd = -1;
             return errno_to_status( ret );
         }
+        port_watch_fd = fd;
         return STATUS_SUCCESS;
     }
 
@@ -828,13 +850,48 @@ static NTSTATUS wait_serial_ports( void *args )
         {
             event = (const struct inotify_event *)p;
             if (deadline) continue;
-            if ((event->mask & IN_Q_OVERFLOW) || (event->len && is_serial_port_name( event->name )))
+            if ((event->mask & IN_Q_OVERFLOW) ||
+                (event->len && (is_serial_port_name( event->name ) || is_port_target_name( event->name ))))
                 deadline = get_monotonic_ms() + 100;
         }
     }
 #else
     return STATUS_NOT_SUPPORTED;
 #endif
+}
+
+/* watch the directories of the targets of the user-defined ports and the ones above them, the
+ * latter tell when the former come back */
+static NTSTATUS watch_port_targets( void *args )
+{
+#if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
+    const struct watch_port_targets_params *params = args;
+    size_t size = 1;
+    char *copy, *path, *p;
+    const char *src;
+
+    for (src = params->paths; *src; src += strlen( src ) + 1) size += strlen( src ) + 1;
+    if (!(copy = malloc( size ))) return STATUS_NO_MEMORY;
+    memcpy( copy, params->paths, size );
+
+    pthread_mutex_lock( &port_targets_mutex );
+    free( port_targets );
+    port_targets = copy;
+    if (port_watch_fd != -1)
+    {
+        for (path = copy; *path; path += strlen( path ) + 1)
+        {
+            if (*path != '/') continue;
+            for (p = path + 1; (p = strchr( p, '/' )); *p++ = '/')
+            {
+                *p = 0;
+                inotify_add_watch( port_watch_fd, path, IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO );
+            }
+        }
+    }
+    pthread_mutex_unlock( &port_targets_mutex );
+#endif
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS set_shell_folder( void *args )
@@ -937,6 +994,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     get_port_device,
     get_port_links,
     wait_serial_ports,
+    watch_port_targets,
     set_shell_folder,
     get_shell_folder,
     dhcp_request,

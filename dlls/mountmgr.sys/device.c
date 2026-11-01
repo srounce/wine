@@ -2262,6 +2262,38 @@ static NTSTATUS set_port_dosdev_symlink( const struct port_type *type, int n, co
     return MOUNTMGR_CALL( set_dosdev_symlink, &params );
 }
 
+/* a user-defined serial port is listed while its target is there, its number stays reserved
+ * meanwhile; anything else is always there */
+static BOOL is_user_port_there( const struct port_type *type, const char *unix_path )
+{
+    ULONGLONG device;
+
+    return type != &serial_type || get_unix_device( unix_path, &device );
+}
+
+/* follow the targets of the user-defined serial ports */
+static void watch_user_ports( const struct port_type *type, char *unix_paths[MAX_PORTS] )
+{
+    struct watch_port_targets_params params;
+    size_t size = 1;
+    char *paths, *p;
+    int n;
+
+    if (type != &serial_type) return;
+    for (n = 0; n < MAX_PORTS; n++) if (unix_paths[n]) size += strlen( unix_paths[n] ) + 1;
+    if (!(p = paths = malloc( size ))) return;
+    for (n = 0; n < MAX_PORTS; n++)
+    {
+        if (!unix_paths[n]) continue;
+        strcpy( p, unix_paths[n] );
+        p += strlen( p ) + 1;
+    }
+    *p = 0;
+    params.paths = paths;
+    MOUNTMGR_CALL( watch_port_targets, &params );
+    free( paths );
+}
+
 /* create a serial or parallel port */
 static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_path, BOOL user_defined,
                                 const WCHAR *instance_id )
@@ -2627,7 +2659,8 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
     /* add user-defined serial ports */
     for (n = 1; n <= MAX_PORTS; n++)
-        if (unix_paths[n - 1]) create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
+        if (unix_paths[n - 1] && is_user_port_there( type, unix_paths[n - 1] ))
+            create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
 
     /* add the ports found in the usual places */
     place_detected_ports( driver, unix_paths );
@@ -2652,6 +2685,7 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
     type = get_port_type( driver );
 
     read_wine_ports( type, unix_paths );
+    watch_user_ports( type, unix_paths );
 
     EnterCriticalSection( &port_section );
 
@@ -2663,12 +2697,15 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
         if (unix_paths[n - 1])
         {
-            if (slot->dev_obj && !slot->user_defined)
+            BOOL there = is_user_port_there( type, unix_paths[n - 1] );
+
+            if (slot->dev_obj && (!slot->user_defined || !there))
             {
                 /* user-defined port replaces a detected one, as it would at startup;
                  * the detected one moves to a free slot in place_detected_ports */
                 remove_port_device( driver, n );
             }
+            if (!there) continue;
             if (!slot->dev_obj)
             {
                 TRACE( "adding %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(unix_paths[n - 1]) );
