@@ -99,6 +99,7 @@ static CRITICAL_SECTION pnp_cs = { &pnp_cs_debug, -1, 0, 0, 0, 0 };
 static struct list usb_nodes = LIST_INIT( usb_nodes );
 static DEVICE_OBJECT *bus_fdo, *bus_pdo;
 static BOOL bus_started;
+static ULONGLONG broadcast_start;     /* when the port message being sent started */
 
 /* duplicate a string, or a REG_MULTI_SZ if multi is set, from the pool for an IRP */
 static WCHAR *pool_strdup( const WCHAR *str, BOOL multi )
@@ -266,11 +267,13 @@ static void invalidate_parent( struct usb_node *node )
     /* otherwise the composite device reports its ports when it starts */
 }
 
-/* a USB serial port was created; id and parent_id are relative to Enum\USB */
-void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *id, const WCHAR *parent_id,
+/* a USB serial port was created; id and parent_id are relative to Enum\USB; returns whether its
+ * node is going to start, which then lists the port */
+BOOL usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *id, const WCHAR *parent_id,
                               int port, int home )
 {
     struct usb_node *parent = NULL, *node;
+    BOOL ret = FALSE;
 
     EnterCriticalSection( &pnp_cs );
 
@@ -282,6 +285,8 @@ void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *
     TRACE( "%s\\%s arrived as COM%u\n", debugstr_w(node->device_id), debugstr_w(node->instance_id), port );
     /* a port that moved to another number while its PDO still exists is reported anew */
     if (node->pdo && node->port != port) node->replace = TRUE;
+    /* a node still started keeps its PDO, which starts no more */
+    ret = bus_started && (!node->pdo || node->replace || !((struct pdo_ext *)node->pdo->DeviceExtension)->enabled);
     node->present = 1;
     node->port = port;
     node->home = home;
@@ -296,6 +301,7 @@ void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *
 
 done:
     LeaveCriticalSection( &pnp_cs );
+    return ret;
 }
 
 /* a USB serial port was removed; id is relative to Enum\USB */
@@ -376,6 +382,18 @@ static NTSTATUS query_bus_relations( struct usb_node *parent, DEVICE_RELATIONS *
     return STATUS_SUCCESS;
 }
 
+/* check whether a window slow to answer a port message holds the PnP manager, which then starts
+ * no device for now */
+BOOL usb_serial_nodes_held(void)
+{
+    BOOL ret;
+
+    EnterCriticalSection( &pnp_cs );
+    ret = broadcast_start && GetTickCount64() - broadcast_start >= 100;
+    LeaveCriticalSection( &pnp_cs );
+    return ret;
+}
+
 /* tell the windows that a COM port arrived or was removed */
 static void broadcast_port_change( int port, UINT code )
 {
@@ -390,7 +408,13 @@ static void broadcast_port_change( int port, UINT code )
     info->dbcp_size = size;
     info->dbcp_devicetype = DBT_DEVTYP_PORT;
     wcscpy( info->dbcp_name, name );
+    EnterCriticalSection( &pnp_cs );
+    broadcast_start = GetTickCount64();
+    LeaveCriticalSection( &pnp_cs );
     BroadcastSystemMessageW( BSF_FORCEIFHUNG | BSF_QUERY, NULL, WM_DEVICECHANGE, code, (LPARAM)info );
+    EnterCriticalSection( &pnp_cs );
+    broadcast_start = 0;
+    LeaveCriticalSection( &pnp_cs );
     free( info );
 }
 
@@ -495,6 +519,9 @@ static NTSTATUS pdo_pnp( DEVICE_OBJECT *device, IRP *irp )
         else if (!ext->enabled)
         {
             set_port_entry( node, port, home );
+            /* as on Windows: the node is complete when SERIALCOMM lists the port, and its
+             * interface arrives after that, before the port message */
+            list_usb_serial_port( port );
             if (!ext->interface.Buffer &&
                 (status = IoRegisterDeviceInterface( device, &comport_guid, NULL, &ext->interface )))
                 ERR( "failed to register the interface of COM%u, status %#lx\n", port, status );

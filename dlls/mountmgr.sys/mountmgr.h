@@ -59,7 +59,9 @@ extern DWORD WINAPI port_watch_thread( void *arg );
 struct serial_port_info;
 extern NTSTATUS WINAPI serial_bus_add_device( DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo );
 extern NTSTATUS WINAPI serial_bus_pnp( DEVICE_OBJECT *device, IRP *irp );
-extern void usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *id,
+extern void list_usb_serial_port( int n );
+extern BOOL usb_serial_nodes_held(void);
+extern BOOL usb_serial_port_arrived( const struct serial_port_info *info, const WCHAR *id,
                                      const WCHAR *parent_id, int port, int home );
 extern void usb_serial_port_removed( const WCHAR *id );
 
