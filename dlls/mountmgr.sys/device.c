@@ -2060,9 +2060,9 @@ struct port_slot
     DEVICE_OBJECT *dev_obj;       /* NT device, NULL if the port doesn't exist */
     char          *unix_path;     /* Unix device the dosdevices symlink points to */
     BOOL           user_defined;  /* port comes from Software\Wine\Ports */
-    WCHAR         *instance_id;   /* Enum\USB key of a detected USB serial port */
+    WCHAR         *instance_id;   /* Enum\USB key of a USB serial port */
     int            home;          /* number a USB serial port goes back to once it is free */
-    BOOL           not_usb;       /* detected serial port known not to be a USB device */
+    BOOL           not_usb;       /* serial port known not to be a USB device */
 };
 
 struct port_type
@@ -2445,26 +2445,32 @@ static void set_detected_ports( const struct port_type *type, const char *device
         type->detected[i] = strdup( devices );
 }
 
-/* check that the device behind a detected port is still the one it was created for */
-static BOOL is_detected_port( const struct port_type *type, const struct port_slot *slot )
+/* check that the USB device behind a serial port is still the one its node was created for, it may
+ * have been replaced by another one with the same Unix device; a failed lookup may only mean that
+ * sysfs isn't ready, so it doesn't take away a port in use */
+static BOOL is_same_usb_device( const struct port_slot *slot )
 {
     struct serial_port_info info;
     WCHAR id[MAX_PATH];
-    int i;
 
-    for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
-        if (!strcmp( slot->unix_path, type->detected[i] )) break;
-    if (i == MAX_PORTS || !type->detected[i]) return FALSE;
-    if (type != &serial_type || slot->not_usb) return TRUE;
-
-    /* a USB device may have been replaced by another one with the same Unix device; a failed
-     * lookup may only mean that sysfs isn't ready, so it doesn't take away a port in use */
     if (get_usb_port_info( slot->unix_path, &info )) return TRUE;
     if (!slot->instance_id) return FALSE;
     get_usb_instance_id( &info, id, ARRAY_SIZE(id), FALSE );
     if (!wcscmp( slot->instance_id, id )) return TRUE;
     get_usb_instance_id( &info, id, ARRAY_SIZE(id), TRUE );
     return !wcscmp( slot->instance_id, id );
+}
+
+/* check that the device behind a detected port is still the one it was created for */
+static BOOL is_detected_port( const struct port_type *type, const struct port_slot *slot )
+{
+    int i;
+
+    for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
+        if (!strcmp( slot->unix_path, type->detected[i] )) break;
+    if (i == MAX_PORTS || !type->detected[i]) return FALSE;
+    if (type != &serial_type || slot->not_usb) return TRUE;
+    return is_same_usb_device( slot );
 }
 
 /* check whether a user-defined port leads to the device of a detected port; a device has a
@@ -2552,6 +2558,37 @@ static void remove_old_port_links( const struct port_type *type )
     }
 }
 
+/* a user-defined port that leads to a USB serial device is the port of that device, with its node,
+ * like a port whose number is changed on Windows; port_section must be held */
+static void add_user_port_node( const struct port_type *type, int n )
+{
+    struct port_slot *slot = &type->slots[n - 1];
+    WCHAR id[MAX_PATH], parent_id[MAX_PATH];
+    struct serial_port_info info;
+    ULONGLONG device, other;
+    NTSTATUS status;
+    BOOL by_port;
+    int i;
+
+    /* a failed lookup is tried again on the next change */
+    if ((status = get_usb_port_info( slot->unix_path, &info )))
+    {
+        slot->not_usb = status == STATUS_NOT_SUPPORTED;
+        return;
+    }
+    /* the device has a single node, even if several user-defined ports lead to it */
+    if (!get_unix_device( slot->unix_path, &device )) return;
+    for (i = 0; i < MAX_PORTS; i++)
+        if (type->slots[i].instance_id && get_unix_device( type->slots[i].unix_path, &other ) &&
+            other == device)
+            return;
+
+    get_new_usb_instance_id( type, &info, id, ARRAY_SIZE(id), &by_port );
+    if (!(slot->instance_id = wcsdup( id ))) return;
+    if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id), by_port );
+    usb_serial_port_arrived( &info, id, info.composite ? parent_id : NULL, n, n );
+}
+
 /* create the ports of the detected devices that have none, without moving the others;
  * port_section must be held */
 static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PORTS] )
@@ -2565,6 +2602,13 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
     WCHAR id[MAX_PATH], parent_id[MAX_PATH];
     HKEY usb_key;
     int i, n, home;
+
+    for (n = 1; type == &serial_type && n <= MAX_PORTS; n++)
+    {
+        slot = &type->slots[n - 1];
+        if (slot->dev_obj && slot->user_defined && !slot->instance_id && !slot->not_usb)
+            add_user_port_node( type, n );
+    }
 
     for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
     {
@@ -2705,6 +2749,12 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
                  * the detected one moves to a free slot in place_detected_ports */
                 remove_port_device( driver, n );
             }
+            else if (slot->instance_id &&
+                     (strcmp( slot->unix_path, unix_paths[n - 1] ) || !is_same_usb_device( slot )))
+            {
+                /* the port leads to another device, which gets its node in place_detected_ports */
+                remove_port_device( driver, n );
+            }
             if (!there) continue;
             if (!slot->dev_obj)
             {
@@ -2719,6 +2769,8 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
                 {
                     free( slot->unix_path );
                     slot->unix_path = path_copy;
+                    /* the new target may be a USB device */
+                    slot->not_usb = FALSE;
                 }
                 else free( path_copy );
             }
