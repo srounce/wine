@@ -260,6 +260,19 @@ static NTSTATUS fdo_pnp(struct bus_device *dev, IRP *irp, IO_STACK_LOCATION *sta
             break;
 
         case IRP_MN_SURPRISE_REMOVAL:
+        {
+            struct bus_device_pdo *child;
+
+            /* The children go away with their parent: they get their
+             * IRP_MN_REMOVE_DEVICE after this, and delete their device then. */
+            ExAcquireFastMutex(&fdo->child_mutex);
+            LIST_FOR_EACH_ENTRY(child, &fdo->children, struct bus_device_pdo, entry)
+                child->removed = TRUE;
+            ExReleaseFastMutex(&fdo->child_mutex);
+            irp->IoStatus.Status = STATUS_SUCCESS;
+            break;
+        }
+
         case IRP_MN_QUERY_REMOVE_DEVICE:
         case IRP_MN_STOP_DEVICE:
             irp->IoStatus.Status = STATUS_SUCCESS;

@@ -3410,6 +3410,128 @@ static BOOL wait_device_present(const WCHAR *instance_id, BOOL present)
     return TRUE;
 }
 
+/* Wine keeps one HKEY_DYN_DATA\Config Manager\Enum key per present device. */
+static unsigned int count_dyn_data_keys(const WCHAR *instance_id)
+{
+    WCHAR name[64], value[MAX_DEVICE_ID_LEN];
+    unsigned int count = 0;
+    DWORD i, size;
+    HKEY key, subkey;
+
+    if (RegOpenKeyExW(HKEY_DYN_DATA, L"Config Manager\\Enum", 0, KEY_READ, &key)) return 0;
+    for (i = 0; ; ++i)
+    {
+        size = ARRAY_SIZE(name);
+        if (RegEnumKeyExW(key, i, name, &size, NULL, NULL, NULL, NULL)) break;
+        if (RegOpenKeyExW(key, name, 0, KEY_READ, &subkey)) continue;
+        size = sizeof(value);
+        if (!RegQueryValueExW(subkey, L"HardWareKey", NULL, NULL, (BYTE *)value, &size) && !wcsicmp(value, instance_id))
+            ++count;
+        RegCloseKey(subkey);
+    }
+    RegCloseKey(key);
+    return count;
+}
+
+/* The descendants of a removed device are removed with it. They stay in the
+ * registry, but they are not present anymore. */
+static void test_pnp_subtree_presence(HANDLE bus)
+{
+    static const struct bus_device_desc subtree_desc[3] =
+    {
+        {
+            .dev_name = L"winetest_pnp_subtree_1",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_1",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+        {
+            .dev_name = L"winetest_pnp_subtree_2",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_2",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+        {
+            .dev_name = L"winetest_pnp_subtree_3",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_3",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+    };
+    static const WCHAR *subtree_id[3] =
+    {
+        L"WINEPNPTEST\\SUBTREE_1\\00",
+        L"WINEPNPTEST\\SUBTREE_2\\00",
+        L"WINEPNPTEST\\SUBTREE_3\\00",
+    };
+    struct pnp_bus_device_data parent[2];
+    struct bus_device_desc desc[3];
+    unsigned int i, count;
+
+    /* Three levels below the bus: removing the first one removes all of them. */
+    for (i = 0; i < 3; ++i)
+    {
+        desc[i] = subtree_desc[i];
+        pnp_bus_test_device_add_child(i ? parent[i - 1].handle : bus, &desc[i], i + 1);
+        if (i < 2) get_pnp_bus_device_data(i + 1, desc[i].dev_name, &parent[i]);
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], TRUE);
+        winetest_pop_context();
+    }
+
+    for (i = 0; i < 2; ++i) pnp_bus_device_data_close(&parent[i]);
+    pnp_bus_test_device_remove_child(bus, &desc[0], 1);
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], FALSE);
+        if (winetest_platform_is_wine)
+        {
+            count = count_dyn_data_keys(subtree_id[i]);
+            ok(!count, "Got %u keys.\n", count);
+        }
+        winetest_pop_context();
+    }
+
+    /* Plugging the first level again does not bring back the levels below it,
+     * until its driver reports them again. */
+    pnp_bus_test_device_add_child(bus, &desc[0], 1);
+    check_device_presence(subtree_id[0], TRUE);
+    check_device_presence(subtree_id[1], FALSE);
+    check_device_presence(subtree_id[2], FALSE);
+    for (i = 1; i < 3; ++i)
+    {
+        get_pnp_bus_device_data(i, desc[i - 1].dev_name, &parent[i - 1]);
+        pnp_bus_test_device_add_child(parent[i - 1].handle, &desc[i], i + 1);
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], TRUE);
+        if (winetest_platform_is_wine)
+        {
+            count = count_dyn_data_keys(subtree_id[i]);
+            ok(count == 1, "Got %u keys.\n", count);
+        }
+        winetest_pop_context();
+    }
+
+    for (i = 0; i < 2; ++i) pnp_bus_device_data_close(&parent[i]);
+    pnp_bus_test_device_remove_child(bus, &desc[0], 1);
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], FALSE);
+        winetest_pop_context();
+    }
+}
+
 static void test_pnp_device_presence(void)
 {
     DEV_BROADCAST_DEVICEINTERFACE_A filter =
@@ -3538,6 +3660,8 @@ static void test_pnp_device_presence(void)
     check_device_presence(L"WINEPNPTEST\\HOLD_START_00\\00", FALSE);
     CloseHandle(entered);
     CloseHandle(release);
+
+    test_pnp_subtree_presence(bus_dev.handle);
 
     pnp_bus_device_data_close(&bus_dev);
     UnregisterDeviceNotification(notify_handle);
