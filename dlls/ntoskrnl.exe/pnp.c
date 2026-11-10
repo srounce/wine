@@ -689,9 +689,16 @@ static void send_remove_device_irp( DEVICE_OBJECT *device, UCHAR code )
     send_pnp_irp( device, code );
 }
 
-static void remove_device( DEVICE_OBJECT *device )
+static void delete_dyn_data_key( DEVICE_OBJECT *device )
 {
     struct wine_device *wine_device = CONTAINING_RECORD(device, struct wine_device, device_obj);
+
+    if (wine_device->children)
+    {
+        ULONG i;
+        for (i = 0; i < wine_device->children->Count; ++i)
+            delete_dyn_data_key( wine_device->children->Objects[i] );
+    }
 
     if (wine_device->dyn_data_key)
     {
@@ -699,6 +706,11 @@ static void remove_device( DEVICE_OBJECT *device )
         RegCloseKey( wine_device->dyn_data_key );
         wine_device->dyn_data_key = 0;
     }
+}
+
+static void remove_device( DEVICE_OBJECT *device )
+{
+    delete_dyn_data_key( device );
 
     send_remove_device_irp( device, IRP_MN_SURPRISE_REMOVAL );
     send_remove_device_irp( device, IRP_MN_REMOVE_DEVICE );
