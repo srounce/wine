@@ -37,7 +37,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(mountmgr);
 
 #define MAX_DOS_DRIVES 26
-#define MAX_PORTS 256
 
 static const WCHAR drive_types[][8] =
 {
@@ -2061,9 +2060,9 @@ struct port_slot
     DEVICE_OBJECT *dev_obj;       /* NT device, NULL if the port doesn't exist */
     char          *unix_path;     /* Unix device the dosdevices symlink points to */
     BOOL           user_defined;  /* port comes from Software\Wine\Ports */
-    WCHAR         *instance_id;   /* Enum\USB key of a detected USB serial port */
+    WCHAR         *instance_id;   /* Enum\USB key of a USB serial port */
     int            home;          /* number a USB serial port goes back to once it is free */
-    BOOL           not_usb;       /* detected serial port known not to be a USB device */
+    BOOL           not_usb;       /* serial port known not to be a USB device */
 };
 
 struct port_type
@@ -2141,12 +2140,13 @@ static BOOL is_valid_usb_serial( const char *serial )
     return TRUE;
 }
 
-/* build the device instance ID of a USB serial port, relative to Enum\USB */
-static void get_usb_instance_id( const struct serial_port_info *info, WCHAR *id, size_t len )
+/* build the device instance ID of a USB serial port, relative to Enum\USB; by_port ties it to
+ * the USB port even if the device has a serial number */
+static void get_usb_instance_id( const struct serial_port_info *info, WCHAR *id, size_t len, BOOL by_port )
 {
     /* the ports of one interface share the device's serial number, and the interfaces of a
      * composite device leave it to their parent */
-    BOOL use_serial = !info->composite && !info->multi_port && is_valid_usb_serial( info->serial );
+    BOOL use_serial = !by_port && !info->composite && !info->multi_port && is_valid_usb_serial( info->serial );
     unsigned int hash = 2166136261u;
     const char *p;
     int pos;
@@ -2159,7 +2159,7 @@ static void get_usb_instance_id( const struct serial_port_info *info, WCHAR *id,
      * device has a serial number, and is tied to the USB port otherwise */
     else
     {
-        if (!is_valid_usb_serial( info->serial ))
+        if (by_port || !is_valid_usb_serial( info->serial ))
             pos += swprintf( id + pos, len - pos, L"\\7&wine&%hs&%u", info->location, info->interface );
         else
         {
@@ -2175,11 +2175,11 @@ static void get_usb_instance_id( const struct serial_port_info *info, WCHAR *id,
 
 /* build the instance ID of the composite device a USB serial port belongs to, relative to
  * Enum\USB; applications such as those using Qt find the serial number there */
-static void get_usb_parent_id( const struct serial_port_info *info, WCHAR *id, size_t len )
+static void get_usb_parent_id( const struct serial_port_info *info, WCHAR *id, size_t len, BOOL by_port )
 {
     int pos = swprintf( id, len, L"VID_%04X&PID_%04X", info->vid, info->pid );
 
-    if (is_valid_usb_serial( info->serial )) swprintf( id + pos, len - pos, L"\\%hs", info->serial );
+    if (!by_port && is_valid_usb_serial( info->serial )) swprintf( id + pos, len - pos, L"\\%hs", info->serial );
     else swprintf( id + pos, len - pos, L"\\7&wine&%hs", info->location );
 }
 
@@ -2240,6 +2240,18 @@ static void scan_usb_port_entries( BOOL reserved[MAX_PORTS], BOOL hide )
     RegCloseKey( usb_key );
 }
 
+static BOOL get_unix_device( const char *unix_path, ULONGLONG *device )
+{
+    struct get_port_device_params params = { unix_path, device };
+
+    return !MOUNTMGR_CALL( get_port_device, &params );
+}
+
+static BOOL port_bit( const BYTE *mask, int n )
+{
+    return mask[(n - 1) / 8] & (1 << ((n - 1) % 8));
+}
+
 /* create or remove the dosdevices symlink of a port */
 static NTSTATUS set_port_dosdev_symlink( const struct port_type *type, int n, const char *unix_path )
 {
@@ -2248,6 +2260,38 @@ static NTSTATUS set_port_dosdev_symlink( const struct port_type *type, int n, co
 
     sprintf( dosdev, type->dosdev_format, n );
     return MOUNTMGR_CALL( set_dosdev_symlink, &params );
+}
+
+/* a user-defined serial port is listed while its target is there, its number stays reserved
+ * meanwhile; anything else is always there */
+static BOOL is_user_port_there( const struct port_type *type, const char *unix_path )
+{
+    ULONGLONG device;
+
+    return type != &serial_type || get_unix_device( unix_path, &device );
+}
+
+/* follow the targets of the user-defined serial ports */
+static void watch_user_ports( const struct port_type *type, char *unix_paths[MAX_PORTS] )
+{
+    struct watch_port_targets_params params;
+    size_t size = 1;
+    char *paths, *p;
+    int n;
+
+    if (type != &serial_type) return;
+    for (n = 0; n < MAX_PORTS; n++) if (unix_paths[n]) size += strlen( unix_paths[n] ) + 1;
+    if (!(p = paths = malloc( size ))) return;
+    for (n = 0; n < MAX_PORTS; n++)
+    {
+        if (!unix_paths[n]) continue;
+        strcpy( p, unix_paths[n] );
+        p += strlen( p ) + 1;
+    }
+    *p = 0;
+    params.paths = paths;
+    MOUNTMGR_CALL( watch_port_targets, &params );
+    free( paths );
 }
 
 /* create a serial or parallel port */
@@ -2401,23 +2445,148 @@ static void set_detected_ports( const struct port_type *type, const char *device
         type->detected[i] = strdup( devices );
 }
 
-/* check that the device behind a detected port is still the one it was created for */
-static BOOL is_detected_port( const struct port_type *type, const struct port_slot *slot )
+/* check that the USB device behind a serial port is still the one its node was created for, it may
+ * have been replaced by another one with the same Unix device; a failed lookup may only mean that
+ * sysfs isn't ready, so it doesn't take away a port in use */
+static BOOL is_same_usb_device( const struct port_slot *slot )
 {
     struct serial_port_info info;
     WCHAR id[MAX_PATH];
+
+    if (get_usb_port_info( slot->unix_path, &info )) return TRUE;
+    if (!slot->instance_id) return FALSE;
+    get_usb_instance_id( &info, id, ARRAY_SIZE(id), FALSE );
+    if (!wcscmp( slot->instance_id, id )) return TRUE;
+    get_usb_instance_id( &info, id, ARRAY_SIZE(id), TRUE );
+    return !wcscmp( slot->instance_id, id );
+}
+
+/* check that the device behind a detected port is still the one it was created for */
+static BOOL is_detected_port( const struct port_type *type, const struct port_slot *slot )
+{
     int i;
 
     for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
         if (!strcmp( slot->unix_path, type->detected[i] )) break;
     if (i == MAX_PORTS || !type->detected[i]) return FALSE;
     if (type != &serial_type || slot->not_usb) return TRUE;
+    return is_same_usb_device( slot );
+}
 
-    /* a USB device may have been replaced by another one with the same Unix device; a failed
-     * lookup may only mean that sysfs isn't ready, so it doesn't take away a port in use */
-    if (get_usb_port_info( slot->unix_path, &info )) return TRUE;
-    get_usb_instance_id( &info, id, ARRAY_SIZE(id) );
-    return slot->instance_id && !wcscmp( slot->instance_id, id );
+/* check whether a user-defined port leads to the device of a detected port; a device has a
+ * single number */
+static BOOL is_user_port_device( const struct port_type *type, char *unix_paths[MAX_PORTS], const char *unix_path )
+{
+    ULONGLONG device, other;
+    int n;
+
+    if (type != &serial_type || !get_unix_device( unix_path, &device ) || !device) return FALSE;
+    for (n = 0; n < MAX_PORTS; n++)
+        if (unix_paths[n] && get_unix_device( unix_paths[n], &other ) && other == device) return TRUE;
+    return FALSE;
+}
+
+/* get the instance ID of a USB serial port that has no port yet; a device with the serial number
+ * of another one that is present is tied to its USB port, as on Windows */
+static void get_new_usb_instance_id( const struct port_type *type, const struct serial_port_info *info,
+                                     WCHAR *id, size_t len, BOOL *by_port )
+{
+    int n;
+
+    *by_port = FALSE;
+    get_usb_instance_id( info, id, len, FALSE );
+    for (n = 0; n < MAX_PORTS; n++)
+    {
+        if (!type->slots[n].instance_id || wcsicmp( type->slots[n].instance_id, id )) continue;
+        *by_port = TRUE;
+        get_usb_instance_id( info, id, len, TRUE );
+        break;
+    }
+}
+
+/* in a prefix from before the numbers were kept, a device keeps the number of the symlink that
+ * leads to it, the way drive letters are kept */
+static int get_linked_port_number( const struct port_type *type, const char *unix_path, char *unix_paths[MAX_PORTS],
+                                   const BOOL reserved[MAX_PORTS] )
+{
+    struct get_port_links_params links = { unix_path };
+    int n;
+
+    if (MOUNTMGR_CALL( get_port_links, &links )) return 0;
+    for (n = 1; n <= MAX_PORTS; n++)
+        if (port_bit( links.device_links, n ) && !type->slots[n - 1].dev_obj && !unix_paths[n - 1] && !reserved[n - 1])
+            return n;
+    return 0;
+}
+
+/* ComDB has a bit for each COM port number in use, like on Windows */
+static void update_com_db( const struct port_type *type, char *unix_paths[MAX_PORTS] )
+{
+    BYTE comdb[MAX_PORTS / 8] = { 0 }, old_comdb[MAX_PORTS / 8];
+    BOOL reserved[MAX_PORTS] = { 0 };
+    DWORD size = sizeof(old_comdb), reg_type;
+    HKEY key;
+    int n;
+
+    scan_usb_port_entries( reserved, FALSE );
+    for (n = 0; n < MAX_PORTS; n++)
+        if (type->slots[n].dev_obj || unix_paths[n] || reserved[n]) comdb[n / 8] |= 1 << (n % 8);
+
+    /* @@ Wine registry key: HKLM\System\CurrentControlSet\Control\COM Name Arbiter */
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\COM Name Arbiter", 0, NULL, 0,
+                         KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL ))
+        return;
+    if (RegQueryValueExW( key, L"ComDB", NULL, &reg_type, old_comdb, &size ) || reg_type != REG_BINARY ||
+        size != sizeof(comdb) || memcmp( comdb, old_comdb, sizeof(comdb) ))
+        RegSetValueExW( key, L"ComDB", 0, REG_BINARY, comdb, sizeof(comdb) );
+    RegCloseKey( key );
+}
+
+/* remove the symlinks of the ports that are gone, they would open whatever device gets their
+ * Unix name; symlinks to anything else are left alone */
+static void remove_old_port_links( const struct port_type *type )
+{
+    struct get_port_links_params links = { NULL };
+    int n;
+
+    if (MOUNTMGR_CALL( get_port_links, &links )) return;
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (!port_bit( links.port_links, n ) || type->slots[n - 1].dev_obj) continue;
+        TRACE( "removing the symlink of %s%u\n", debugstr_w(type->wine_prefix), n );
+        set_port_dosdev_symlink( type, n, NULL );
+    }
+}
+
+/* a user-defined port that leads to a USB serial device is the port of that device, with its node,
+ * like a port whose number is changed on Windows; port_section must be held */
+static void add_user_port_node( const struct port_type *type, int n )
+{
+    struct port_slot *slot = &type->slots[n - 1];
+    WCHAR id[MAX_PATH], parent_id[MAX_PATH];
+    struct serial_port_info info;
+    ULONGLONG device, other;
+    NTSTATUS status;
+    BOOL by_port;
+    int i;
+
+    /* a failed lookup is tried again on the next change */
+    if ((status = get_usb_port_info( slot->unix_path, &info )))
+    {
+        slot->not_usb = status == STATUS_NOT_SUPPORTED;
+        return;
+    }
+    /* the device has a single node, even if several user-defined ports lead to it */
+    if (!get_unix_device( slot->unix_path, &device )) return;
+    for (i = 0; i < MAX_PORTS; i++)
+        if (type->slots[i].instance_id && get_unix_device( type->slots[i].unix_path, &other ) &&
+            other == device)
+            return;
+
+    get_new_usb_instance_id( type, &info, id, ARRAY_SIZE(id), &by_port );
+    if (!(slot->instance_id = wcsdup( id ))) return;
+    if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id), by_port );
+    usb_serial_port_arrived( &info, id, info.composite ? parent_id : NULL, n, n );
 }
 
 /* create the ports of the detected devices that have none, without moving the others;
@@ -2425,13 +2594,21 @@ static BOOL is_detected_port( const struct port_type *type, const struct port_sl
 static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PORTS] )
 {
     const struct port_type *type = get_port_type( driver );
-    BOOL reserved[MAX_PORTS] = { 0 }, scanned = FALSE;
+    BOOL reserved[MAX_PORTS] = { 0 }, scanned = FALSE, by_port = FALSE;
+    struct get_port_links_params links = { NULL };
     struct serial_port_info info;
     struct port_slot *slot;
     NTSTATUS status;
     WCHAR id[MAX_PATH], parent_id[MAX_PATH];
     HKEY usb_key;
     int i, n, home;
+
+    for (n = 1; type == &serial_type && n <= MAX_PORTS; n++)
+    {
+        slot = &type->slots[n - 1];
+        if (slot->dev_obj && slot->user_defined && !slot->instance_id && !slot->not_usb)
+            add_user_port_node( type, n );
+    }
 
     for (i = 0; i < MAX_PORTS && type->detected[i]; i++)
     {
@@ -2442,11 +2619,14 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
                 break;
         }
         if (n <= MAX_PORTS) continue;
+        if (is_user_port_device( type, unix_paths, type->detected[i] )) continue;
 
-        /* keep the numbers of absent USB serial ports for when they come back, as Windows does */
+        /* keep the numbers of absent USB serial ports for when they come back, as Windows does;
+         * a number with a symlink may be the one of a device that comes later */
         if (type == &serial_type && !scanned)
         {
             scan_usb_port_entries( reserved, FALSE );
+            MOUNTMGR_CALL( get_port_links, &links );
             scanned = TRUE;
         }
 
@@ -2454,7 +2634,7 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
         status = type == &serial_type ? get_usb_port_info( type->detected[i], &info ) : STATUS_NOT_SUPPORTED;
         if (!status)
         {
-            get_usb_instance_id( &info, id, ARRAY_SIZE(id) );
+            get_new_usb_instance_id( type, &info, id, ARRAY_SIZE(id), &by_port );
             if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, ENUM_USB_KEY, 0, KEY_READ, &usb_key ))
             {
                 home = get_usb_port_number( usb_key, id );
@@ -2468,11 +2648,16 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
                 else home = 0;
             }
         }
+        if (!n && !home && type == &serial_type)
+            n = get_linked_port_number( type, type->detected[i], unix_paths, reserved );
         if (!n)
         {
-            for (n = 1; n <= MAX_PORTS; n++)
-                if (!type->slots[n - 1].dev_obj && !unix_paths[n - 1] && !reserved[n - 1]) break;
-            if (n > MAX_PORTS) break;
+            /* the USB ports leave COM1 and COM2 to the legacy ports, as on Windows */
+            for (n = status == STATUS_NOT_SUPPORTED ? 1 : 3; n <= MAX_PORTS; n++)
+                if (!type->slots[n - 1].dev_obj && !unix_paths[n - 1] && !reserved[n - 1] &&
+                    !port_bit( links.port_links, n ) && !port_bit( links.other_links, n )) break;
+            /* the devices that come next may have a number already */
+            if (n > MAX_PORTS) continue;
         }
         if (!home) home = n;
 
@@ -2484,10 +2669,12 @@ static void place_detected_ports( DRIVER_OBJECT *driver, char *unix_paths[MAX_PO
         if (!status)
         {
             slot->home = home;
-            if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id) );
+            if (info.composite) get_usb_parent_id( &info, parent_id, ARRAY_SIZE(parent_id), by_port );
             usb_serial_port_arrived( &info, id, info.composite ? parent_id : NULL, n, home );
         }
     }
+
+    if (type == &serial_type) update_com_db( type, unix_paths );
 }
 
 /* find and create serial or parallel ports */
@@ -2516,10 +2703,13 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
     /* add user-defined serial ports */
     for (n = 1; n <= MAX_PORTS; n++)
-        if (unix_paths[n - 1]) create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
+        if (unix_paths[n - 1] && is_user_port_there( type, unix_paths[n - 1] ))
+            create_port_device( driver, n, unix_paths[n - 1], TRUE, NULL );
 
     /* add the ports found in the usual places */
     place_detected_ports( driver, unix_paths );
+
+    if (type == &serial_type) remove_old_port_links( type );
 
     LeaveCriticalSection( &port_section );
 
@@ -2539,6 +2729,7 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
     type = get_port_type( driver );
 
     read_wine_ports( type, unix_paths );
+    watch_user_ports( type, unix_paths );
 
     EnterCriticalSection( &port_section );
 
@@ -2550,12 +2741,21 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
         if (unix_paths[n - 1])
         {
-            if (slot->dev_obj && !slot->user_defined)
+            BOOL there = is_user_port_there( type, unix_paths[n - 1] );
+
+            if (slot->dev_obj && (!slot->user_defined || !there))
             {
                 /* user-defined port replaces a detected one, as it would at startup;
                  * the detected one moves to a free slot in place_detected_ports */
                 remove_port_device( driver, n );
             }
+            else if (slot->instance_id &&
+                     (strcmp( slot->unix_path, unix_paths[n - 1] ) || !is_same_usb_device( slot )))
+            {
+                /* the port leads to another device, which gets its node in place_detected_ports */
+                remove_port_device( driver, n );
+            }
+            if (!there) continue;
             if (!slot->dev_obj)
             {
                 TRACE( "adding %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(unix_paths[n - 1]) );
@@ -2569,6 +2769,8 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
                 {
                     free( slot->unix_path );
                     slot->unix_path = path_copy;
+                    /* the new target may be a USB device */
+                    slot->not_usb = FALSE;
                 }
                 else free( path_copy );
             }
@@ -2578,9 +2780,11 @@ static void sync_port_devices( DRIVER_OBJECT *driver, const char *devices )
             /* only a USB serial port pushed aside from this number moves back into it, below */
             remove_port_device( driver, n );
         }
-        else if (slot->dev_obj && !is_detected_port( type, slot ))
+        else if (slot->dev_obj && (!is_detected_port( type, slot ) ||
+                                   is_user_port_device( type, unix_paths, slot->unix_path )))
         {
-            /* the device is gone, or replaced by another one that gets its own port */
+            /* the device is gone, replaced by another one that gets its own port, or a
+             * user-defined port leads to it now */
             TRACE( "removing detected %s%u -> %s\n", debugstr_w(type->wine_prefix), n, debugstr_a(slot->unix_path) );
             remove_port_device( driver, n );
         }
@@ -2686,6 +2890,14 @@ DWORD WINAPI port_watch_thread( void *arg )
     return 0;
 }
 
+/* a port is opened through its dosdevices symlink, so this is only reached when its device is gone */
+static NTSTATUS WINAPI serial_create( DEVICE_OBJECT *device, IRP *irp )
+{
+    irp->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 /* driver entry point for the serial port driver */
 NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 {
@@ -2693,7 +2905,7 @@ NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path
     struct detect_ports_params params = { devices, sizeof(devices) };
 
     serial_driver = driver;
-    /* TODO: fill in driver->MajorFunction */
+    driver->MajorFunction[IRP_MJ_CREATE] = serial_create;
 
     MOUNTMGR_CALL( detect_serial_ports, &params );
     create_port_devices( driver, devices );

@@ -673,6 +673,7 @@ NTSTATUS WINAPI NtUserBuildNameList( HWINSTA handle, ULONG size, struct ntuser_n
         list->strings[result / sizeof(WCHAR)] = 0;
         *ret_size = header_size + total;
     }
+    free( buffer );
     return status;
 }
 

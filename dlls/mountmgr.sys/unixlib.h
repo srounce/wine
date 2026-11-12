@@ -130,10 +130,31 @@ struct cdrom_ioctl_params
     unsigned int ret_size;
 };
 
+#define MAX_PORTS 256
+
 struct detect_ports_params
 {
     char *names;
     ULONG size;
+};
+
+struct get_port_device_params
+{
+    const char *unix_path;
+    ULONGLONG  *device;        /* out: number of the character device behind the path, 0 for anything else */
+};
+
+struct get_port_links_params
+{
+    const char *unix_path;                   /* in: a Unix device, may be NULL */
+    BYTE        device_links[MAX_PORTS / 8]; /* out: comN symlinks that lead to that device */
+    BYTE        port_links[MAX_PORTS / 8];   /* out: comN symlinks to serial ports, present or not */
+    BYTE        other_links[MAX_PORTS / 8];  /* out: comN symlinks to anything else */
+};
+
+struct watch_port_targets_params
+{
+    const char *paths;  /* targets of the user-defined ports, each null-terminated, then an empty one */
 };
 
 struct serial_port_info
@@ -205,7 +226,10 @@ enum mountmgr_funcs
     unix_detect_serial_ports,
     unix_detect_parallel_ports,
     unix_get_serial_port_info,
+    unix_get_port_device,
+    unix_get_port_links,
     unix_wait_serial_ports,
+    unix_watch_port_targets,
     unix_set_shell_folder,
     unix_get_shell_folder,
     unix_dhcp_request,

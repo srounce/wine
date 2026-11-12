@@ -45,6 +45,7 @@
 #ifdef HAVE_SYS_INOTIFY_H
 # include <sys/inotify.h>
 # include <poll.h>
+# include <pthread.h>
 # include <time.h>
 #endif
 #include <unistd.h>
@@ -127,7 +128,8 @@ static int compare_numbers( const void *a, const void *b )
     return x < y ? -1 : x > y;
 }
 
-static void detect_devices( const char **paths, char *names, ULONG size )
+static void detect_devices( const char **paths, BOOL (*is_port)( const char *unix_path ),
+                            char *names, ULONG size )
 {
     while (*paths)
     {
@@ -160,6 +162,7 @@ static void detect_devices( const char **paths, char *names, ULONG size )
         {
             int len = snprintf( unix_path, sizeof(unix_path), *paths, numbers[i] );
             if (len + 2 > size) break;
+            if (is_port && !is_port( unix_path )) continue;
             strcpy( names, unix_path );
             names += len + 1;
             size -= len + 1;
@@ -529,44 +532,7 @@ static NTSTATUS check_device_access( void *args )
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS detect_serial_ports( void *args )
-{
-    const struct detect_ports_params *params = args;
-    static const char *paths[] =
-    {
 #ifdef linux
-        "/dev/ttyS%u",
-        "/dev/ttyUSB%u",
-        "/dev/ttyACM%u",
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-        "/dev/cuau%u",
-#elif defined(__DragonFly__)
-        "/dev/cuaa%u",
-#endif
-        NULL
-    };
-
-    detect_devices( paths, params->names, params->size );
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS detect_parallel_ports( void *args )
-{
-    const struct detect_ports_params *params = args;
-    static const char *paths[] =
-    {
-#ifdef linux
-        "/dev/lp%u",
-#endif
-        NULL
-    };
-
-    detect_devices( paths, params->names, params->size );
-    return STATUS_SUCCESS;
-}
-
-#ifdef linux
-
 /* read a sysfs attribute without its trailing newline */
 static BOOL read_sysfs_string( const char *dir, const char *name, char *buffer, size_t size )
 {
@@ -583,6 +549,60 @@ static BOOL read_sysfs_string( const char *dir, const char *name, char *buffer, 
     buffer[len] = 0;
     return len > 0;
 }
+
+#endif
+
+/* the 8250 driver creates nr_uarts ttyS devices, with or without an UART behind them; the empty
+ * ones have type 0 (PORT_UNKNOWN), they open and then fail with EIO */
+static BOOL is_serial_port( const char *unix_path )
+{
+#ifdef linux
+    char dir[64], type[16];
+
+    snprintf( dir, sizeof(dir), "/sys/class/tty/%s", strrchr( unix_path, '/' ) + 1 );
+    if (read_sysfs_string( dir, "type", type, sizeof(type) ) && !strcmp( type, "0" )) return FALSE;
+#endif
+    return TRUE;
+}
+
+static const char *serial_port_paths[] =
+{
+#ifdef linux
+    "/dev/ttyS%u",
+    "/dev/ttyUSB%u",
+    "/dev/ttyACM%u",
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    "/dev/cuau%u",
+#elif defined(__DragonFly__)
+    "/dev/cuaa%u",
+#endif
+    NULL
+};
+
+static NTSTATUS detect_serial_ports( void *args )
+{
+    const struct detect_ports_params *params = args;
+
+    detect_devices( serial_port_paths, is_serial_port, params->names, params->size );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS detect_parallel_ports( void *args )
+{
+    const struct detect_ports_params *params = args;
+    static const char *paths[] =
+    {
+#ifdef linux
+        "/dev/lp%u",
+#endif
+        NULL
+    };
+
+    detect_devices( paths, NULL, params->names, params->size );
+    return STATUS_SUCCESS;
+}
+
+#ifdef linux
 
 /* count the serial ports of a USB interface directory */
 static int count_interface_ports( const char *dir )
@@ -692,10 +712,83 @@ static NTSTATUS get_serial_port_info( void *args )
 #endif
 }
 
+static NTSTATUS get_port_device( void *args )
+{
+    const struct get_port_device_params *params = args;
+    struct stat st;
+
+    if (stat( params->unix_path, &st ) == -1) return STATUS_NO_SUCH_DEVICE;
+    *params->device = S_ISCHR( st.st_mode ) ? st.st_rdev : 0;
+    return STATUS_SUCCESS;
+}
+
+/* check whether a symlink is one that mountmgr creates for a serial port */
+static BOOL is_serial_port_link( const char *target )
+{
+    const char **paths;
+
+    if (!strncmp( target, "/dev/serial/", 12 )) return TRUE;
+    for (paths = serial_port_paths; *paths; paths++)
+    {
+        size_t len = strlen( *paths ) - 2;
+
+        if (!strncmp( target, *paths, len ) && target[len] && !target[len + strspn( target + len, "0123456789" )])
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static NTSTATUS get_port_links( void *args )
+{
+    struct get_port_links_params *params = args;
+    char *path, *name, target[PATH_MAX];
+    struct stat st, device_st;
+    BOOL has_device;
+    unsigned int n;
+    int len;
+
+    has_device = params->unix_path && !stat( params->unix_path, &device_st ) && S_ISCHR( device_st.st_mode );
+    if (!(path = get_dosdevices_path( "com256" ))) return STATUS_NO_MEMORY;
+    name = path + strlen( path ) - 6;
+    for (n = 0; n < MAX_PORTS; n++)
+    {
+        sprintf( name, "com%u", n + 1 );
+        if ((len = readlink( path, target, sizeof(target) - 1 )) == -1) continue;
+        target[len] = 0;
+        if (is_serial_port_link( target )) params->port_links[n / 8] |= 1 << (n % 8);
+        else params->other_links[n / 8] |= 1 << (n % 8);
+        if (has_device && !stat( path, &st ) && S_ISCHR( st.st_mode ) && st.st_rdev == device_st.st_rdev)
+            params->device_links[n / 8] |= 1 << (n % 8);
+    }
+    free( path );
+    return STATUS_SUCCESS;
+}
+
 #if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
 static BOOL is_serial_port_name( const char *name )
 {
     return !strncmp( name, "ttyS", 4 ) || !strncmp( name, "ttyUSB", 6 ) || !strncmp( name, "ttyACM", 6 );
+}
+
+/* the inotify descriptor and the targets of the user-defined ports, which may be anywhere */
+static int port_watch_fd = -1;
+static char *port_targets;
+static pthread_mutex_t port_targets_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* check whether a name is a part of the path of a user-defined port; a device directory such as
+ * /dev/serial/by-id comes and goes along with the devices */
+static BOOL is_port_target_name( const char *name )
+{
+    size_t len = strlen( name );
+    const char *path, *p;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &port_targets_mutex );
+    for (path = port_targets; path && *path && !ret; path += strlen( path ) + 1)
+        for (p = path; !ret && (p = strstr( p, name )); p += len)
+            ret = p > path && p[-1] == '/' && (!p[len] || p[len] == '/');
+    pthread_mutex_unlock( &port_targets_mutex );
+    return ret;
 }
 
 static LONGLONG get_monotonic_ms(void)
@@ -711,7 +804,7 @@ static LONGLONG get_monotonic_ms(void)
 static NTSTATUS wait_serial_ports( void *args )
 {
 #if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
-    static int fd = -1;
+    int fd = port_watch_fd;
     char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
     const struct inotify_event *event;
     struct pollfd pfd;
@@ -727,9 +820,9 @@ static NTSTATUS wait_serial_ports( void *args )
         {
             ret = errno;
             close( fd );
-            fd = -1;
             return errno_to_status( ret );
         }
+        port_watch_fd = fd;
         return STATUS_SUCCESS;
     }
 
@@ -757,13 +850,48 @@ static NTSTATUS wait_serial_ports( void *args )
         {
             event = (const struct inotify_event *)p;
             if (deadline) continue;
-            if ((event->mask & IN_Q_OVERFLOW) || (event->len && is_serial_port_name( event->name )))
+            if ((event->mask & IN_Q_OVERFLOW) ||
+                (event->len && (is_serial_port_name( event->name ) || is_port_target_name( event->name ))))
                 deadline = get_monotonic_ms() + 100;
         }
     }
 #else
     return STATUS_NOT_SUPPORTED;
 #endif
+}
+
+/* watch the directories of the targets of the user-defined ports and the ones above them, the
+ * latter tell when the former come back */
+static NTSTATUS watch_port_targets( void *args )
+{
+#if defined(linux) && defined(HAVE_SYS_INOTIFY_H)
+    const struct watch_port_targets_params *params = args;
+    size_t size = 1;
+    char *copy, *path, *p;
+    const char *src;
+
+    for (src = params->paths; *src; src += strlen( src ) + 1) size += strlen( src ) + 1;
+    if (!(copy = malloc( size ))) return STATUS_NO_MEMORY;
+    memcpy( copy, params->paths, size );
+
+    pthread_mutex_lock( &port_targets_mutex );
+    free( port_targets );
+    port_targets = copy;
+    if (port_watch_fd != -1)
+    {
+        for (path = copy; *path; path += strlen( path ) + 1)
+        {
+            if (*path != '/') continue;
+            for (p = path + 1; (p = strchr( p, '/' )); *p++ = '/')
+            {
+                *p = 0;
+                inotify_add_watch( port_watch_fd, path, IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO );
+            }
+        }
+    }
+    pthread_mutex_unlock( &port_targets_mutex );
+#endif
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS set_shell_folder( void *args )
@@ -863,7 +991,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     detect_serial_ports,
     detect_parallel_ports,
     get_serial_port_info,
+    get_port_device,
+    get_port_links,
     wait_serial_ports,
+    watch_port_targets,
     set_shell_folder,
     get_shell_folder,
     dhcp_request,
