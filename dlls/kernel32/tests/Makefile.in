@@ -1,5 +1,5 @@
 TESTDLL   = kernel32.dll
-IMPORTS   = user32 advapi32
+IMPORTS   = setupapi user32 advapi32
 
 SOURCES = \
 	actctx.c \

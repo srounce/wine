@@ -40,6 +40,7 @@
 #include "winspool.h"
 #include "ntddstor.h"
 #include "setupapi.h"
+#include "cfgmgr32.h"
 #include "devguid.h"
 
 #include "wine/debug.h"
@@ -379,6 +380,7 @@ static const struct column col_pnpentity[] =
 {
     { L"Caption",              CIM_STRING|COL_FLAG_DYNAMIC },
     { L"ClassGuid",            CIM_STRING|COL_FLAG_DYNAMIC },
+    { L"Description",          CIM_STRING|COL_FLAG_DYNAMIC },
     { L"DeviceId",             CIM_STRING|COL_FLAG_DYNAMIC },
     { L"Manufacturer",         CIM_STRING },
     { L"Name",                 CIM_STRING|COL_FLAG_DYNAMIC },
@@ -961,6 +963,7 @@ struct record_pnpentity
 {
     const WCHAR *caption;
     const WCHAR *class_guid;
+    const WCHAR *description;
     const WCHAR *device_id;
     const WCHAR *manufacturer;
     const WCHAR *name;
@@ -3586,18 +3589,54 @@ static WCHAR *build_pnp_device_id( const WCHAR *class, const WCHAR *product, con
     return ret;
 }
 
+static WCHAR *get_present_device_ids(void)
+{
+    WCHAR *ids = NULL;
+    CONFIGRET cr;
+    ULONG len;
+
+    do
+    {
+        free( ids );
+        if (CM_Get_Device_ID_List_SizeW( &len, NULL, CM_GETIDLIST_FILTER_PRESENT )) return NULL;
+        if (!(ids = malloc( len * sizeof(WCHAR) ))) return NULL;
+    } while ((cr = CM_Get_Device_ID_ListW( NULL, ids, len, CM_GETIDLIST_FILTER_PRESENT )) == CR_BUFFER_SMALL);
+
+    if (cr)
+    {
+        free( ids );
+        return NULL;
+    }
+    return ids;
+}
+
+static BOOL is_device_present( const WCHAR *ids, const WCHAR *device_id )
+{
+    for (const WCHAR *id = ids; *id; id += wcslen( id ) + 1)
+        if (!wcsicmp( id, device_id )) return TRUE;
+    return FALSE;
+}
+
 static struct record_pnpentity *get_pnp_entities( UINT *count )
 {
     WCHAR class[MAX_PATH], product[MAX_PATH], instance[MAX_PATH];
     DWORD nb_allocated = 16, i = 0, idx_enum = 0, idx_class = 0, idx_product = 0;
     HKEY key_enum, key_class, key_product, key_instance;
     struct record_pnpentity *ret, *tmp;
+    WCHAR *ids, *device_id;
     LONG res;
 
     if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Enum", 0, KEY_ENUMERATE_SUB_KEYS, &key_enum ))
         return NULL;
+    /* like on Windows, devices which aren't present are not listed */
+    if (!(ids = get_present_device_ids()))
+    {
+        RegCloseKey( key_enum );
+        return NULL;
+    }
     if (!(ret = malloc( nb_allocated * sizeof(*ret) )))
     {
+        free( ids );
         RegCloseKey( key_enum );
         return NULL;
     }
@@ -3612,13 +3651,19 @@ static struct record_pnpentity *get_pnp_entities( UINT *count )
                 {
                     while (RegEnumKeyW( key_product, idx_product++, instance, ARRAY_SIZE(instance) ) != ERROR_NO_MORE_ITEMS)
                     {
-                        if (!RegOpenKeyExW( key_product, instance, 0, KEY_READ, &key_instance ))
+                        if (!(device_id = build_pnp_device_id( class, product, instance ))) continue;
+                        if (!is_device_present( ids, device_id ) || RegOpenKeyExW( key_product, instance, 0, KEY_READ, &key_instance ))
+                            free( device_id );
+                        else
                         {
-                            ret[i].caption = get_reg_value( key_instance, L"DeviceDesc" );
+                            /* like on Windows, the name is the friendly name, or the description */
+                            if (!(ret[i].caption = get_reg_value( key_instance, L"FriendlyName" )))
+                                ret[i].caption = get_reg_value( key_instance, L"DeviceDesc" );
                             ret[i].class_guid = wcslwr( get_reg_value( key_instance, L"ClassGUID" ) );
-                            ret[i].device_id = wcsupr( build_pnp_device_id( class, product, instance ) );
+                            ret[i].description = get_reg_value( key_instance, L"DeviceDesc" );
+                            ret[i].device_id = wcsupr( device_id );
                             ret[i].manufacturer = L"The Wine Project";
-                            ret[i].name = get_reg_value( key_instance, L"DeviceDesc" );
+                            ret[i].name = ret[i].caption ? wcsdup( ret[i].caption ) : NULL;
                             ret[i].service = get_reg_value( key_instance, L"Service" );
                             RegCloseKey( key_instance );
                             if (++i >= nb_allocated)
@@ -3631,6 +3676,7 @@ static struct record_pnpentity *get_pnp_entities( UINT *count )
                                     {
                                         free( (void *)ret[i].caption );
                                         free( (void *)ret[i].class_guid );
+                                        free( (void *)ret[i].description );
                                         free( (void *)ret[i].device_id );
                                         free( (void *)ret[i].name );
                                         free( (void *)ret[i].service );
@@ -3650,6 +3696,7 @@ static struct record_pnpentity *get_pnp_entities( UINT *count )
     }
 
 done:
+    free( ids );
     RegCloseKey( key_enum );
     if (!i)
     {
@@ -3678,6 +3725,7 @@ static enum fill_status fill_pnpentity( struct table *table, const struct expr *
         rec = (struct record_pnpentity *)(table->data + offset);
         rec->caption      = entities[i].caption;
         rec->class_guid   = entities[i].class_guid;
+        rec->description  = entities[i].description;
         rec->device_id    = entities[i].device_id;
         rec->manufacturer = entities[i].manufacturer;
         rec->name         = entities[i].name;

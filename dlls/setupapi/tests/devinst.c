@@ -39,6 +39,7 @@
 #include "cfgmgr32.h"
 #include "cguid.h"
 #include "fci.h"
+#include "newdev.h"
 
 #include "wine/test.h"
 #include "wine/mssign.h"
@@ -1276,7 +1277,7 @@ static void test_device_property(void)
     ok(err == NO_ERROR, "Expect last error %#x, got %#lx\n", NO_ERROR, err);
     ok(type == DEVPROP_TYPE_GUID, "Expect type %#x, got %#lx\n", DEVPROP_TYPE_GUID, type);
     ok(size == sizeof(guid_val), "Got size %lu\n", size);
-    ok(IsEqualGUID(&guid_val, &guid), "Expect buffer %s, got %s\n", debugstr_guid(&guid), debugstr_guid(&guid_val));
+    ok(IsEqualGUID(&guid_val, &guid), "Expect buffer %s, got %s\n", wine_dbgstr_guid(&guid), wine_dbgstr_guid(&guid_val));
 
     for (i = 0; i < ARRAY_SIZE(inbuilt_props); i++)
     {
@@ -1770,6 +1771,110 @@ static void test_register_device_info(void)
         ret = SetupDiRemoveDevice(set, &device);
         ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
     }
+
+    SetupDiDestroyDeviceInfoList(set);
+}
+
+static BOOL device_id_listed(const WCHAR *instance_id, ULONG flags)
+{
+    WCHAR *buffer, *id;
+    BOOL found = FALSE;
+    ULONG size = 0;
+    CONFIGRET cr;
+
+    flags |= CM_GETIDLIST_FILTER_ENUMERATOR;
+    do
+    {
+        /* The list may grow between the two calls. */
+        cr = CM_Get_Device_ID_List_SizeW(&size, L"Root", flags);
+        ok(!cr, "Got unexpected error %#lx.\n", cr);
+        buffer = malloc(size * sizeof(*buffer));
+        cr = CM_Get_Device_ID_ListW(L"Root", buffer, size, flags);
+        if (cr == CR_BUFFER_SMALL) free(buffer);
+    } while (cr == CR_BUFFER_SMALL);
+    ok(!cr, "Got unexpected error %#lx.\n", cr);
+    for (id = buffer; !cr && *id; id += wcslen(id) + 1)
+        if (!wcsicmp(id, instance_id)) found = TRUE;
+    free(buffer);
+    return found;
+}
+
+static BOOL class_device_listed(const char *instance_id, DWORD flags)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    char id[MAX_DEVICE_ID_LEN];
+    BOOL found = FALSE;
+    HDEVINFO set;
+    DWORD i;
+
+    set = SetupDiGetClassDevsA(&guid, NULL, NULL, flags);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    for (i = 0; SetupDiEnumDeviceInfo(set, i, &device); ++i)
+    {
+        SetupDiGetDeviceInstanceIdA(set, &device, id, sizeof(id), NULL);
+        if (!strcasecmp(id, instance_id)) found = TRUE;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
+static void test_device_presence(void)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    DEVPROP_BOOLEAN is_present;
+    DEVPROPTYPE type;
+    BOOL listed, ret;
+    HDEVINFO set;
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+
+    /* A device which is created but not registered is a phantom. */
+    ret = SetupDiCreateDeviceInfoA(set, "Root\\LEGACY_BOGUS\\0000", &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(listed, "Device is not listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(!listed, "Phantom device is present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", 0);
+    ok(!listed, "Phantom device is listed.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(!listed, "Phantom device is present.\n");
+    is_present = 0xcc;
+    type = 0xdeadbeef;
+    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_IsPresent, &type, (BYTE *)&is_present,
+            sizeof(is_present), NULL, 0);
+    ok(ret, "Failed to get DEVPKEY_Device_IsPresent, error %#lx.\n", GetLastError());
+    ok(type == DEVPROP_TYPE_BOOLEAN, "Got type %#lx.\n", type);
+    ok(is_present == DEVPROP_FALSE, "Got IsPresent %#x.\n", is_present);
+
+    /* A registered root-enumerated device is present, even without a driver. */
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(listed, "Device is not listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(listed, "Device is not present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", 0);
+    ok(listed, "Device is not listed.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(listed, "Device is not present.\n");
+    is_present = 0xcc;
+    type = 0xdeadbeef;
+    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_IsPresent, &type, (BYTE *)&is_present,
+            sizeof(is_present), NULL, 0);
+    ok(ret, "Failed to get DEVPKEY_Device_IsPresent, error %#lx.\n", GetLastError());
+    ok(type == DEVPROP_TYPE_BOOLEAN, "Got type %#lx.\n", type);
+    ok(is_present == DEVPROP_TRUE, "Got IsPresent %#x.\n", is_present);
+
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_NONE);
+    ok(!listed, "Removed device is listed.\n");
+    listed = device_id_listed(L"ROOT\\LEGACY_BOGUS\\0000", CM_GETIDLIST_FILTER_PRESENT);
+    ok(!listed, "Removed device is present.\n");
+    listed = class_device_listed("Root\\LEGACY_BOGUS\\0000", DIGCF_PRESENT);
+    ok(!listed, "Removed device is present.\n");
 
     SetupDiDestroyDeviceInfoList(set);
 }
@@ -3306,7 +3411,7 @@ static void test_device_interface_properties(void)
     ok(ret, "SetupDiGetDeviceInterfacePropertyW failed: %lu\n", GetLastError());
     ok(type == DEVPROP_TYPE_GUID, "%#lx != %#x\n", type, DEVPROP_TYPE_GUID);
     ok(req == sizeof(guid), "%lu != %lu\n", req, (DWORD)sizeof(guid));
-    ok(IsEqualGUID(&guid_val, &guid), "%s != %s", debugstr_guid( &guid_val ), debugstr_guid( &guid ));
+    ok(IsEqualGUID(&guid_val, &guid), "%s != %s", wine_dbgstr_guid( &guid_val ), wine_dbgstr_guid( &guid ));
 
     type = DEVPROP_TYPE_EMPTY;
     req = 0;
@@ -4616,7 +4721,7 @@ static void test_SetupDiOpenDeviceInterface(void)
     ret = SetupDiOpenDeviceInterfaceW(set, device_path, 0, &iface);
     ok(ret, "got error %lu.\n", GetLastError());
     ok(IsEqualGUID(&iface.InterfaceClassGuid, &GUID_DEVINTERFACE_DISPLAY_ADAPTER), "got %s.\n",
-            debugstr_guid(&iface.InterfaceClassGuid));
+            wine_dbgstr_guid(&iface.InterfaceClassGuid));
     memset(&iface, 0xcc, sizeof(iface));
     iface.cbSize = sizeof(iface);
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISPLAY_ADAPTER, 0, &iface);
@@ -4631,7 +4736,7 @@ static void test_SetupDiOpenDeviceInterface(void)
     ret = SetupDiOpenDeviceInterfaceA(set, device_patha, 0, &iface);
     ok(ret, "got error %lu.\n", GetLastError());
     ok(IsEqualGUID(&iface.InterfaceClassGuid, &GUID_DEVINTERFACE_DISPLAY_ADAPTER), "got %s.\n",
-            debugstr_guid(&iface.InterfaceClassGuid));
+            wine_dbgstr_guid(&iface.InterfaceClassGuid));
     memset(&iface, 0xcc, sizeof(iface));
     iface.cbSize = sizeof(iface);
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISPLAY_ADAPTER, 0, &iface);
@@ -5359,6 +5464,507 @@ static void test_driver_store(struct testsign_context *ctx)
     ok(ret, "Failed to destroy device list.\n");
 }
 
+static CONFIGRET (WINAPI *pCM_Get_DevNode_PropertyW)(DEVINST, const DEVPROPKEY *, DEVPROPTYPE *, BYTE *, ULONG *, ULONG);
+static CONFIGRET (WINAPI *pCM_Get_DevNode_Property_Keys)(DEVINST, DEVPROPKEY *, ULONG *, ULONG);
+
+static void check_driver_property_(int line, HDEVINFO set, SP_DEVINFO_DATA *device,
+        const DEVPROPKEY *key, const WCHAR *expect)
+{
+    WCHAR buffer[MAX_PATH];
+    DEVPROPTYPE type;
+    CONFIGRET cr;
+    DWORD size;
+    ULONG len;
+    BOOL ret;
+
+    type = 0xdeadbeef;
+    size = 0xdeadbeef;
+    memset(buffer, 0, sizeof(buffer));
+    ret = SetupDiGetDevicePropertyW(set, device, key, &type, (BYTE *)buffer, sizeof(buffer), &size, 0);
+    ok_(__FILE__, line)(ret, "SetupDiGetDevicePropertyW(pid %lu) failed, error %lu.\n", key->pid, GetLastError());
+    ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "SetupDiGetDevicePropertyW(pid %lu): got type %#lx.\n", key->pid, type);
+    ok_(__FILE__, line)(ret && !wcscmp(buffer, expect), "SetupDiGetDevicePropertyW(pid %lu): got %s, expected %s.\n",
+            key->pid, ret ? debugstr_w(buffer) : "(none)", debugstr_w(expect));
+    ok_(__FILE__, line)(!ret || size == (wcslen(expect) + 1) * sizeof(WCHAR),
+            "SetupDiGetDevicePropertyW(pid %lu): got size %lu.\n", key->pid, size);
+
+    type = 0xdeadbeef;
+    len = sizeof(buffer);
+    memset(buffer, 0, sizeof(buffer));
+    cr = pCM_Get_DevNode_PropertyW(device->DevInst, key, &type, (BYTE *)buffer, &len, 0);
+    ok_(__FILE__, line)(cr == CR_SUCCESS, "CM_Get_DevNode_PropertyW(pid %lu) returned %#lx.\n", key->pid, cr);
+    ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "CM_Get_DevNode_PropertyW(pid %lu): got type %#lx.\n", key->pid, type);
+    ok_(__FILE__, line)(!cr && !wcscmp(buffer, expect), "CM_Get_DevNode_PropertyW(pid %lu): got %s, expected %s.\n",
+            key->pid, cr ? "(none)" : debugstr_w(buffer), debugstr_w(expect));
+}
+#define check_driver_property(a,b,c,d) check_driver_property_(__LINE__,a,b,c,d)
+
+static void check_driver_date_(int line, HDEVINFO set, SP_DEVINFO_DATA *device, ULONGLONG expect)
+{
+    ULARGE_INTEGER date;
+    DEVPROPTYPE type;
+    CONFIGRET cr;
+    DWORD size;
+    ULONG len;
+    BOOL ret;
+
+    type = 0xdeadbeef;
+    size = 0xdeadbeef;
+    date.QuadPart = 0xdeadbeef;
+    ret = SetupDiGetDevicePropertyW(set, device, &DEVPKEY_Device_DriverDate, &type, (BYTE *)&date, sizeof(date), &size, 0);
+    ok_(__FILE__, line)(ret, "Failed to get DEVPKEY_Device_DriverDate, error %lu.\n", GetLastError());
+    ok_(__FILE__, line)(type == DEVPROP_TYPE_FILETIME, "Got type %#lx.\n", type);
+    ok_(__FILE__, line)(size == sizeof(date), "Got size %lu.\n", size);
+    ok_(__FILE__, line)(ret && date.QuadPart == expect, "Got date %#I64x, expected %#I64x.\n", date.QuadPart, expect);
+
+    type = 0xdeadbeef;
+    len = sizeof(date);
+    date.QuadPart = 0xdeadbeef;
+    cr = pCM_Get_DevNode_PropertyW(device->DevInst, &DEVPKEY_Device_DriverDate, &type, (BYTE *)&date, &len, 0);
+    ok_(__FILE__, line)(cr == CR_SUCCESS, "CM_Get_DevNode_PropertyW returned %#lx.\n", cr);
+    ok_(__FILE__, line)(type == DEVPROP_TYPE_FILETIME, "CM_Get_DevNode_PropertyW: got type %#lx.\n", type);
+    ok_(__FILE__, line)(!cr && date.QuadPart == expect, "CM_Get_DevNode_PropertyW: got date %#I64x, expected %#I64x.\n",
+            date.QuadPart, expect);
+}
+#define check_driver_date(a,b,c) check_driver_date_(__LINE__,a,b,c)
+
+static unsigned int count_property_key(const DEVPROPKEY *keys, ULONG count, const DEVPROPKEY *key)
+{
+    unsigned int n = 0;
+    ULONG i;
+
+    for (i = 0; i < count; ++i)
+        if (IsEqualGUID(&keys[i].fmtid, &key->fmtid) && keys[i].pid == key->pid) ++n;
+    return n;
+}
+
+/* Each property of the driver is listed once, by both APIs. */
+static void check_driver_property_keys_(int line, HDEVINFO set, SP_DEVINFO_DATA *device)
+{
+    static const DEVPROPKEY *driver_keys[] =
+    {
+        &DEVPKEY_Device_DriverDate, &DEVPKEY_Device_DriverVersion, &DEVPKEY_Device_DriverDesc,
+        &DEVPKEY_Device_DriverInfPath, &DEVPKEY_Device_DriverInfSection, &DEVPKEY_Device_MatchingDeviceId,
+        &DEVPKEY_Device_DriverProvider,
+    };
+    DEVPROPKEY keys[128];
+    unsigned int i, n;
+    ULONG count;
+    CONFIGRET cr;
+    DWORD size;
+    BOOL ret;
+
+    size = 0;
+    ret = SetupDiGetDevicePropertyKeys(set, device, keys, ARRAY_SIZE(keys), &size, 0);
+    ok_(__FILE__, line)(ret, "SetupDiGetDevicePropertyKeys failed, error %lu.\n", GetLastError());
+    for (i = 0; i < ARRAY_SIZE(driver_keys); ++i)
+    {
+        n = count_property_key(keys, min(size, ARRAY_SIZE(keys)), driver_keys[i]);
+        ok_(__FILE__, line)(n == 1, "SetupDiGetDevicePropertyKeys: pid %lu listed %u times.\n", driver_keys[i]->pid, n);
+    }
+
+    count = ARRAY_SIZE(keys);
+    cr = pCM_Get_DevNode_Property_Keys(device->DevInst, keys, &count, 0);
+    ok_(__FILE__, line)(cr == CR_SUCCESS, "CM_Get_DevNode_Property_Keys returned %#lx.\n", cr);
+    for (i = 0; i < ARRAY_SIZE(driver_keys); ++i)
+    {
+        n = count_property_key(keys, min(count, ARRAY_SIZE(keys)), driver_keys[i]);
+        ok_(__FILE__, line)(n == 1, "CM_Get_DevNode_Property_Keys: pid %lu listed %u times.\n", driver_keys[i]->pid, n);
+    }
+}
+#define check_driver_property_keys(a,b) check_driver_property_keys_(__LINE__,a,b)
+
+static void check_driver_key_value_(int line, HKEY key, const WCHAR *name, const WCHAR *expect)
+{
+    WCHAR buffer[MAX_PATH];
+    DWORD type, size;
+    LONG res;
+
+    size = sizeof(buffer);
+    memset(buffer, 0, sizeof(buffer));
+    res = RegQueryValueExW(key, name, NULL, &type, (BYTE *)buffer, &size);
+    ok_(__FILE__, line)(!res, "Failed to get %s, error %lu.\n", debugstr_w(name), res);
+    ok_(__FILE__, line)(type == REG_SZ, "%s: got type %lu.\n", debugstr_w(name), type);
+    ok_(__FILE__, line)(!res && !wcscmp(buffer, expect), "%s: got %s, expected %s.\n",
+            debugstr_w(name), res ? "(none)" : debugstr_w(buffer), debugstr_w(expect));
+}
+#define check_driver_key_value(a,b,c) check_driver_key_value_(__LINE__,a,b,c)
+
+/* Writes and signs the INF and the catalog name.inf and name.cat, of a driver for hardware_id. The model refers to
+ * the model_section, and the install_section is the one that has the services. */
+static void create_driver_properties_inf(struct testsign_context *ctx, const char *name, const char *driver_ver,
+        const char *hardware_id, const char *model_section, const char *install_section)
+{
+    char inf_data[1024], file[MAX_PATH];
+    WCHAR catalog_name[MAX_PATH];
+    HANDLE catalog;
+    BOOL ret;
+
+    sprintf(inf_data,
+            "[Version]\n"
+            "Signature=\"$WINDOWS NT$\"\n"
+            "Class=System\n"
+            "ClassGUID={4d36e97d-e325-11ce-bfc1-08002be10318}\n"
+            "Provider=%%prov%%\n"
+            "CatalogFile=%s.cat\n"
+            "%s"
+            "[Manufacturer]\n"
+            "%%mfg%%=models,NT" MYEXT "\n"
+            "[models.NT" MYEXT "]\n"
+            "%%desc%%=%s,%s\n"
+            "[%s]\n"
+            "[%s.Services]\n"
+            "AddService=,2\n"
+            "[Strings]\n"
+            "prov=\"Wine test provider\"\n"
+            "mfg=\"Wine test manufacturer\"\n"
+            "desc=\"Wine test driver properties device\"\n",
+            name, driver_ver, model_section, hardware_id, install_section, install_section);
+    sprintf(file, "%s.inf", name);
+    create_file(file, inf_data);
+
+    swprintf(catalog_name, ARRAY_SIZE(catalog_name), L"%hs.cat", name);
+    catalog = CryptCATOpen(catalog_name, CRYPTCAT_OPEN_CREATENEW, 0, CRYPTCAT_VERSION_1, 0);
+    ok(catalog != INVALID_HANDLE_VALUE, "Failed to create catalog, error %#lx\n", GetLastError());
+    swprintf(catalog_name, ARRAY_SIZE(catalog_name), L"%hs.inf", name);
+    add_file_to_catalog(catalog, catalog_name);
+    ret = CryptCATPersistStore(catalog);
+    todo_wine ok(ret, "Failed to write catalog, error %lu\n", GetLastError());
+    ret = CryptCATClose(catalog);
+    ok(ret, "Failed to close catalog, error %lu\n", GetLastError());
+    swprintf(catalog_name, ARRAY_SIZE(catalog_name), L"%hs.cat", name);
+    testsign_sign(ctx, catalog_name);
+}
+
+static void test_driver_properties(struct testsign_context *ctx)
+{
+    static const char hardware_id[] = "winetest_drvprop_hardware_id\0";
+    static const WCHAR desc[] = L"Wine test driver properties device", provider[] = L"Wine test provider";
+    static const struct
+    {
+        const char *driver_ver;
+        const WCHAR *version;
+        DWORDLONG version_num;
+        WORD year, month, day;
+        const WCHAR *date;
+        const char *inf_id;
+    }
+    tests[] =
+    {
+        /* without DriverVer the version is 0.0.0.0 and the date is the FILETIME epoch */
+        {"",                                  L"0.0.0.0",    0,                  1601, 1, 1,  L"1-1-1601"},
+        {"DriverVer=09/16/2024,3.9.2024.9\n", L"3.9.2024.9", 0x0003000907e80009, 2024, 9, 16, L"9-16-2024"},
+        {"DriverVer=09/16/2024\n",            L"0.0.0.0",    0,                  2024, 9, 16, L"9-16-2024"},
+        /* a version of fewer parts is completed with zeros, and the parts after the fourth are ignored */
+        {"DriverVer=09/16/2024,1.0\n",        L"1.0.0.0",    0x0001000000000000, 2024, 9, 16, L"9-16-2024"},
+        {"DriverVer=09/16/2024,1.2.3\n",      L"1.2.3.0",    0x0001000200030000, 2024, 9, 16, L"9-16-2024"},
+        {"DriverVer=09/16/2024,7\n",          L"7.0.0.0",    0x0007000000000000, 2024, 9, 16, L"9-16-2024"},
+        {"DriverVer=09/16/2024,1.2.3.4.5\n",  L"1.2.3.4",    0x0001000200030004, 2024, 9, 16, L"9-16-2024"},
+        /* each part has 16 bits, and one that isn't a number makes the whole version zero */
+        {"DriverVer=09/16/2024,70000.1.1.1\n", L"4464.1.1.1", 0x1170000100010001, 2024, 9, 16, L"9-16-2024"},
+        {"DriverVer=09/16/2024,1.2a.3.4\n",   L"0.0.0.0",    0,                  2024, 9, 16, L"9-16-2024"},
+        /* an invalid date is zero, but the version is still read */
+        {"DriverVer=9/6/24,1.2.3.4\n",        L"1.2.3.4",    0x0001000200030004, 1601, 1, 1,  L"1-1-1601"},
+        {"DriverVer=13/45/2024,1.2.3.4\n",    L"1.2.3.4",    0x0001000200030004, 1601, 1, 1,  L"1-1-1601"},
+        {"DriverVer=9/6/2024,1.2.3.4\n",      L"1.2.3.4",    0x0001000200030004, 2024, 9, 6,  L"9-6-2024"},
+        /* the matching ID is the one of the device, not the one of the INF */
+        {"DriverVer=09/16/2024,1.2.3.4\n",    L"1.2.3.4",    0x0001000200030004, 2024, 9, 16, L"9-16-2024",
+         "WineTest_DrvProp_Hardware_ID"},
+    };
+    BOOL (WINAPI *pUpdateDriverForPlugAndPlayDevicesA)(HWND, const char *, const char *, DWORD, BOOL *);
+    SP_DEVINSTALL_PARAMS_A params = {sizeof(params)};
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    SP_DRVINFO_DATA_W driver = {sizeof(driver)};
+    char orig_cwd[MAX_PATH], inf_path[MAX_PATH], *cwd;
+    WCHAR buffer[MAX_PATH], inf_name[MAX_PATH], inf_section[LINE_LEN];
+    ULARGE_INTEGER date;
+    SYSTEMTIME system_time = {0};
+    BOOL ret, need_reboot;
+    DWORD type, size;
+    unsigned int i;
+    HDEVINFO set;
+    HKEY key;
+    LONG res;
+
+    if (wow64)
+    {
+        skip("Device installation is not supported under WoW64.\n");
+        return;
+    }
+
+    pCM_Get_DevNode_PropertyW = (void *)GetProcAddress(LoadLibraryA("cfgmgr32.dll"), "CM_Get_DevNode_PropertyW");
+    pCM_Get_DevNode_Property_Keys = (void *)GetProcAddress(LoadLibraryA("cfgmgr32.dll"), "CM_Get_DevNode_Property_Keys");
+    pUpdateDriverForPlugAndPlayDevicesA = (void *)GetProcAddress(LoadLibraryA("newdev.dll"), "UpdateDriverForPlugAndPlayDevicesA");
+    if (!pCM_Get_DevNode_PropertyW || !pCM_Get_DevNode_Property_Keys || !pUpdateDriverForPlugAndPlayDevicesA)
+    {
+        win_skip("CM_Get_DevNode_PropertyW, CM_Get_DevNode_Property_Keys or UpdateDriverForPlugAndPlayDevicesA not available.\n");
+        return;
+    }
+
+    GetCurrentDirectoryA(sizeof(orig_cwd), orig_cwd);
+    cwd = tempnam(NULL, "wine");
+    ret = CreateDirectoryA(cwd, NULL);
+    ok(ret, "Failed to create %s, error %lu.\n", debugstr_a(cwd), GetLastError());
+    ret = SetCurrentDirectoryA(cwd);
+    ok(ret, "Failed to cd to %s, error %lu.\n", debugstr_a(cwd), GetLastError());
+    sprintf(inf_path, "%s\\winetest_drvprop.inf", cwd);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%u", i);
+
+        create_driver_properties_inf(ctx, "winetest_drvprop", tests[i].driver_ver,
+                tests[i].inf_id ? tests[i].inf_id : hardware_id, "inst", "inst.NT");
+
+        system_time.wYear = tests[i].year;
+        system_time.wMonth = tests[i].month;
+        system_time.wDay = tests[i].day;
+        SystemTimeToFileTime(&system_time, (FILETIME *)&date);
+
+        set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_SYSTEM, NULL);
+        ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+        if (SetupDiOpenDeviceInfoA(set, "Root\\winetest_drvprop\\0", NULL, 0, &device))
+        {
+            ret = SetupDiCallClassInstaller(DIF_REMOVE, set, &device);
+            ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+        }
+        ret = SetupDiCreateDeviceInfoA(set, "Root\\winetest_drvprop\\0", &GUID_DEVCLASS_SYSTEM, NULL, NULL, 0, &device);
+        ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+        ret = SetupDiSetDeviceRegistryPropertyA(set, &device, SPDRP_HARDWAREID,
+                (const BYTE *)hardware_id, sizeof(hardware_id));
+        ok(ret, "Failed to set hardware ID, error %#lx.\n", GetLastError());
+        ret = SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &device);
+        ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+
+        /* the driver list takes the date and version from DriverVer */
+        ret = SetupDiGetDeviceInstallParamsA(set, &device, &params);
+        ok(ret, "Failed to get install params, error %#lx.\n", GetLastError());
+        strcpy(params.DriverPath, inf_path);
+        params.Flags |= DI_ENUMSINGLEINF;
+        ret = SetupDiSetDeviceInstallParamsA(set, &device, &params);
+        ok(ret, "Failed to set install params, error %#lx.\n", GetLastError());
+        ret = SetupDiBuildDriverInfoList(set, &device, SPDIT_COMPATDRIVER);
+        ok(ret, "Failed to build driver list, error %#lx.\n", GetLastError());
+        ret = SetupDiEnumDriverInfoW(set, &device, SPDIT_COMPATDRIVER, 0, &driver);
+        ok(ret, "Failed to enumerate drivers, error %#lx.\n", GetLastError());
+        ok(!wcscmp(driver.Description, desc), "Got description %s.\n", debugstr_w(driver.Description));
+        ok(!wcscmp(driver.ProviderName, provider), "Got provider %s.\n", debugstr_w(driver.ProviderName));
+        ok(driver.DriverVersion == tests[i].version_num, "Got version %#I64x.\n", driver.DriverVersion);
+        ok(((ULARGE_INTEGER *)&driver.DriverDate)->QuadPart == date.QuadPart,
+                "Got date %#lx%08lx.\n", driver.DriverDate.dwHighDateTime, driver.DriverDate.dwLowDateTime);
+
+        ret = pUpdateDriverForPlugAndPlayDevicesA(NULL, "winetest_drvprop_hardware_id", inf_path, INSTALLFLAG_FORCE, &need_reboot);
+        ok(ret, "Failed to install device, error %#lx.\n", GetLastError());
+        SetupDiDestroyDeviceInfoList(set);
+
+        set = SetupDiCreateDeviceInfoList(NULL, NULL);
+        ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+        ret = SetupDiOpenDeviceInfoA(set, "Root\\winetest_drvprop\\0", NULL, 0, &device);
+        ok(ret, "Failed to open device, error %#lx.\n", GetLastError());
+
+        /* the installer writes the driver values to the driver key */
+        key = SetupDiOpenDevRegKey(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_ALL_ACCESS);
+        ok(key != INVALID_HANDLE_VALUE, "Failed to open driver key, error %#lx.\n", GetLastError());
+        check_driver_key_value(key, L"DriverDesc", desc);
+        check_driver_key_value(key, L"ProviderName", provider);
+        check_driver_key_value(key, L"DriverVersion", tests[i].version);
+        check_driver_key_value(key, L"DriverDate", tests[i].date);
+        check_driver_key_value(key, L"MatchingDeviceId", L"winetest_drvprop_hardware_id");
+        size = sizeof(buffer);
+        res = RegQueryValueExW(key, L"DriverDateData", NULL, &type, (BYTE *)buffer, &size);
+        ok(!res, "Failed to get DriverDateData, error %lu.\n", res);
+        ok(type == REG_BINARY, "DriverDateData: got type %lu.\n", type);
+        ok(size == sizeof(ULARGE_INTEGER), "DriverDateData: got size %lu.\n", size);
+        ok(!res && ((ULARGE_INTEGER *)buffer)->QuadPart == date.QuadPart,
+                "DriverDateData: got %#I64x.\n", ((ULARGE_INTEGER *)buffer)->QuadPart);
+
+        size = sizeof(inf_name);
+        inf_name[0] = 0;
+        res = RegQueryValueExW(key, L"InfPath", NULL, &type, (BYTE *)inf_name, &size);
+        ok(!res, "Failed to get InfPath, error %lu.\n", res);
+        ok(!wcschr(inf_name, '\\') && wcslen(inf_name) > 4 && !wcsicmp(inf_name + wcslen(inf_name) - 4, L".inf"),
+                "Got InfPath %s.\n", debugstr_w(inf_name));
+        size = sizeof(inf_section);
+        inf_section[0] = 0;
+        res = RegQueryValueExW(key, L"InfSection", NULL, &type, (BYTE *)inf_section, &size);
+        ok(!res, "Failed to get InfSection, error %lu.\n", res);
+
+        /* and the same values come out as device properties, from both APIs */
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverDesc, desc);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverProvider, provider);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverVersion, tests[i].version);
+        check_driver_property(set, &device, &DEVPKEY_Device_MatchingDeviceId, L"winetest_drvprop_hardware_id");
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverInfPath, inf_name);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverInfSection, inf_section);
+        check_driver_date(set, &device, date.QuadPart);
+        check_driver_property_keys(set, &device);
+
+        /* the driver key holds a copy: changing it doesn't change the properties */
+        res = RegSetValueExW(key, L"DriverDesc", 0, REG_SZ, (const BYTE *)L"changed", sizeof(L"changed"));
+        ok(!res, "Failed to set DriverDesc, error %lu.\n", res);
+        res = RegSetValueExW(key, L"ProviderName", 0, REG_SZ, (const BYTE *)L"changed", sizeof(L"changed"));
+        ok(!res, "Failed to set ProviderName, error %lu.\n", res);
+        res = RegSetValueExW(key, L"DriverVersion", 0, REG_SZ, (const BYTE *)L"9.9.9.9", sizeof(L"9.9.9.9"));
+        ok(!res, "Failed to set DriverVersion, error %lu.\n", res);
+        res = RegDeleteValueW(key, L"InfPath");
+        ok(!res, "Failed to delete InfPath, error %lu.\n", res);
+        RegCloseKey(key);
+
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverDesc, desc);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverProvider, provider);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverVersion, tests[i].version);
+        check_driver_property(set, &device, &DEVPKEY_Device_DriverInfPath, inf_name);
+
+        ret = SetupDiCallClassInstaller(DIF_REMOVE, set, &device);
+        ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+        SetupDiDestroyDeviceInfoList(set);
+
+        if (inf_name[0])
+        {
+            ret = SetupUninstallOEMInfW(inf_name, 0, NULL);
+            ok(ret, "Failed to uninstall %s, error %lu.\n", debugstr_w(inf_name), GetLastError());
+        }
+        delete_file("winetest_drvprop.cat");
+        delete_file("winetest_drvprop.inf");
+
+        winetest_pop_context();
+    }
+
+    SetCurrentDirectoryA(orig_cwd);
+    ret = RemoveDirectoryA(cwd);
+    ok(ret, "Failed to delete %s, error %lu.\n", cwd, GetLastError());
+}
+
+static void check_no_driver_property_(int line, HDEVINFO set, SP_DEVINFO_DATA *device, const DEVPROPKEY *key)
+{
+    WCHAR buffer[MAX_PATH];
+    DEVPROPTYPE type;
+    CONFIGRET cr;
+    DWORD size;
+    ULONG len;
+    BOOL ret;
+
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDevicePropertyW(set, device, key, &type, (BYTE *)buffer, sizeof(buffer), &size, 0);
+    ok_(__FILE__, line)(!ret, "SetupDiGetDevicePropertyW(pid %lu) succeeded, got %s.\n", key->pid, debugstr_w(buffer));
+    ok_(__FILE__, line)(GetLastError() == ERROR_NOT_FOUND, "SetupDiGetDevicePropertyW(pid %lu): got error %lu.\n",
+            key->pid, GetLastError());
+
+    len = sizeof(buffer);
+    cr = pCM_Get_DevNode_PropertyW(device->DevInst, key, &type, (BYTE *)buffer, &len, 0);
+    ok_(__FILE__, line)(cr == CR_NO_SUCH_VALUE, "CM_Get_DevNode_PropertyW(pid %lu) returned %#lx.\n", key->pid, cr);
+}
+#define check_no_driver_property(a,b,c) check_no_driver_property_(__LINE__,a,b,c)
+
+/* Installing another driver on a device replaces the properties of the driver, including those the new one doesn't have. */
+static void test_driver_properties_replace(struct testsign_context *ctx)
+{
+    static const char hardware_id[] = "winetest_drvprop_hardware_id\0";
+    BOOL (WINAPI *pUpdateDriverForPlugAndPlayDevicesA)(HWND, const char *, const char *, DWORD, BOOL *);
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    char orig_cwd[MAX_PATH], inf_path[MAX_PATH], *cwd;
+    WCHAR inf_name_a[MAX_PATH], inf_name_b[MAX_PATH];
+    BOOL ret, need_reboot;
+    DWORD size;
+    HDEVINFO set;
+    HKEY key;
+    LONG res;
+
+    if (wow64)
+    {
+        skip("Device installation is not supported under WoW64.\n");
+        return;
+    }
+
+    pCM_Get_DevNode_PropertyW = (void *)GetProcAddress(LoadLibraryA("cfgmgr32.dll"), "CM_Get_DevNode_PropertyW");
+    pUpdateDriverForPlugAndPlayDevicesA = (void *)GetProcAddress(LoadLibraryA("newdev.dll"), "UpdateDriverForPlugAndPlayDevicesA");
+    if (!pCM_Get_DevNode_PropertyW || !pUpdateDriverForPlugAndPlayDevicesA)
+    {
+        win_skip("CM_Get_DevNode_PropertyW or UpdateDriverForPlugAndPlayDevicesA not available.\n");
+        return;
+    }
+
+    GetCurrentDirectoryA(sizeof(orig_cwd), orig_cwd);
+    cwd = tempnam(NULL, "wine");
+    ret = CreateDirectoryA(cwd, NULL);
+    ok(ret, "Failed to create %s, error %lu.\n", debugstr_a(cwd), GetLastError());
+    ret = SetCurrentDirectoryA(cwd);
+    ok(ret, "Failed to cd to %s, error %lu.\n", debugstr_a(cwd), GetLastError());
+
+    create_driver_properties_inf(ctx, "winetest_drvprop_a", "DriverVer=09/16/2024,1.0.0.0\n", (const char *)hardware_id, "inst", "inst.NT");
+    create_driver_properties_inf(ctx, "winetest_drvprop_b", "DriverVer=10/16/2025,2.0.0.0\n", (const char *)hardware_id, "plain", "plain");
+
+    set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_SYSTEM, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    if (SetupDiOpenDeviceInfoA(set, "Root\\winetest_drvprop\\0", NULL, 0, &device))
+    {
+        ret = SetupDiCallClassInstaller(DIF_REMOVE, set, &device);
+        ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    }
+    ret = SetupDiCreateDeviceInfoA(set, "Root\\winetest_drvprop\\0", &GUID_DEVCLASS_SYSTEM, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    ret = SetupDiSetDeviceRegistryPropertyA(set, &device, SPDRP_HARDWAREID, (const BYTE *)hardware_id, sizeof(hardware_id));
+    ok(ret, "Failed to set hardware ID, error %#lx.\n", GetLastError());
+    ret = SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &device);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+    SetupDiDestroyDeviceInfoList(set);
+
+    set = SetupDiCreateDeviceInfoList(NULL, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+
+    sprintf(inf_path, "%s\\winetest_drvprop_a.inf", cwd);
+    ret = pUpdateDriverForPlugAndPlayDevicesA(NULL, "winetest_drvprop_hardware_id", inf_path, INSTALLFLAG_FORCE, &need_reboot);
+    ok(ret, "Failed to install driver A, error %#lx.\n", GetLastError());
+    ret = SetupDiOpenDeviceInfoA(set, "Root\\winetest_drvprop\\0", NULL, 0, &device);
+    ok(ret, "Failed to open device, error %#lx.\n", GetLastError());
+    check_driver_property(set, &device, &DEVPKEY_Device_DriverVersion, L"1.0.0.0");
+    key = SetupDiOpenDevRegKey(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+    ok(key != INVALID_HANDLE_VALUE, "Failed to open driver key, error %#lx.\n", GetLastError());
+    size = sizeof(inf_name_a);
+    inf_name_a[0] = 0;
+    RegQueryValueExW(key, L"InfPath", NULL, NULL, (BYTE *)inf_name_a, &size);
+    RegCloseKey(key);
+
+    sprintf(inf_path, "%s\\winetest_drvprop_b.inf", cwd);
+    ret = pUpdateDriverForPlugAndPlayDevicesA(NULL, "winetest_drvprop_hardware_id", inf_path, INSTALLFLAG_FORCE, &need_reboot);
+    ok(ret, "Failed to install driver B, error %#lx.\n", GetLastError());
+    check_driver_property(set, &device, &DEVPKEY_Device_DriverVersion, L"2.0.0.0");
+    check_driver_property(set, &device, &DEVPKEY_Device_DriverInfSection, L"plain");
+    check_no_driver_property(set, &device, &DEVPKEY_Device_DriverInfSectionExt);
+
+    key = SetupDiOpenDevRegKey(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+    ok(key != INVALID_HANDLE_VALUE, "Failed to open driver key, error %#lx.\n", GetLastError());
+    size = sizeof(inf_name_b);
+    inf_name_b[0] = 0;
+    RegQueryValueExW(key, L"InfPath", NULL, NULL, (BYTE *)inf_name_b, &size);
+    res = RegQueryValueExW(key, L"InfSectionExt", NULL, NULL, NULL, NULL);
+    ok(res == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", res);
+    RegCloseKey(key);
+
+    ret = SetupDiCallClassInstaller(DIF_REMOVE, set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    SetupDiDestroyDeviceInfoList(set);
+
+    if (inf_name_a[0])
+    {
+        ret = SetupUninstallOEMInfW(inf_name_a, 0, NULL);
+        ok(ret, "Failed to uninstall %s, error %lu.\n", debugstr_w(inf_name_a), GetLastError());
+    }
+    if (inf_name_b[0] && wcscmp(inf_name_a, inf_name_b))
+    {
+        ret = SetupUninstallOEMInfW(inf_name_b, 0, NULL);
+        ok(ret, "Failed to uninstall %s, error %lu.\n", debugstr_w(inf_name_b), GetLastError());
+    }
+    delete_file("winetest_drvprop_a.cat");
+    delete_file("winetest_drvprop_a.inf");
+    delete_file("winetest_drvprop_b.cat");
+    delete_file("winetest_drvprop_b.inf");
+
+    SetCurrentDirectoryA(orig_cwd);
+    ret = RemoveDirectoryA(cwd);
+    ok(ret, "Failed to delete %s, error %lu.\n", cwd, GetLastError());
+}
+
 static void test_device_enum(void)
 {
     SP_DEVINFO_DATA devinfodata;
@@ -5621,6 +6227,193 @@ static void test_class_device_order(void)
     ok(ret, "Failed to destroy device list, error %#lx.\n", GetLastError());
 }
 
+static BOOL class_guids_contain(const GUID *guids, DWORD count, const GUID *class)
+{
+    while (count--) if (IsEqualGUID(guids + count, class)) return TRUE;
+    return FALSE;
+}
+
+static void check_class_guids_(int line, const WCHAR *name, const GUID *class, BOOL expect)
+{
+    char nameA[MAX_PATH];
+    GUID guids[16];
+    DWORD count;
+    BOOL ret;
+
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameW(name, guids, ARRAY_SIZE(guids), &count);
+    ok_(__FILE__, line)(ret, "%s: got error %#lx.\n", debugstr_w(name), GetLastError());
+    ok_(__FILE__, line)(count <= ARRAY_SIZE(guids), "%s: got %lu GUIDs.\n", debugstr_w(name), count);
+    ok_(__FILE__, line)(class_guids_contain(guids, ret ? min(count, ARRAY_SIZE(guids)) : 0, class) == expect,
+            "%s: class %s %s.\n", debugstr_w(name), wine_dbgstr_guid(class), expect ? "not found" : "found");
+
+    WideCharToMultiByte(CP_ACP, 0, name, -1, nameA, sizeof(nameA), NULL, NULL);
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameA(nameA, guids, ARRAY_SIZE(guids), &count);
+    ok_(__FILE__, line)(ret, "%s: got error %#lx.\n", debugstr_a(nameA), GetLastError());
+    ok_(__FILE__, line)(class_guids_contain(guids, ret ? min(count, ARRAY_SIZE(guids)) : 0, class) == expect,
+            "%s: class %s %s.\n", debugstr_a(nameA), wine_dbgstr_guid(class), expect ? "not found" : "found");
+}
+#define check_class_guids(a,b,c) check_class_guids_(__LINE__,a,b,c)
+
+static void test_class_guids_from_name(void)
+{
+    static const GUID named_class = {0x00000001, 0x3f65, 0x11db, {0xb7,0x04,0x00,0x11,0x95,0x5c,0x2b,0xdb}};
+    static const WCHAR unnamed_key[] = L"System\\CurrentControlSet\\Control\\Class\\{00000000-3f65-11db-b704-0011955c2bdb}";
+    static const WCHAR named_key[] = L"System\\CurrentControlSet\\Control\\Class\\{00000001-3f65-11db-b704-0011955c2bdb}";
+    static const char inf_data[] =
+            "[Version]\n"
+            "Signature=\"$Chicago$\"\n"
+            "Class=WineTestNamedClass\n"
+            "ClassGUID={00000001-3f65-11db-b704-0011955c2bdb}\n"
+            "[ClassInstall32]\n"
+            "AddReg=NamedClass.NT.AddReg\n"
+            "[NamedClass.NT.AddReg]\n"
+            "HKR,,,,\"Wine test named class\"\n";
+    WCHAR buffer[MAX_PATH];
+    char tmpfile[MAX_PATH];
+    GUID guids[16];
+    DWORD count;
+    LSTATUS res;
+    HKEY key;
+    BOOL ret;
+
+    /* the class name is the Class value of the class key, not its description */
+    check_class_guids(L"Ports", &GUID_DEVCLASS_PORTS, TRUE);
+    check_class_guids(L"ports", &GUID_DEVCLASS_PORTS, TRUE);
+    check_class_guids(L"Modem", &GUID_DEVCLASS_MODEM, TRUE);
+    ret = SetupDiGetClassDescriptionW(&GUID_DEVCLASS_PORTS, buffer, ARRAY_SIZE(buffer), NULL);
+    ok(ret, "Failed to get class description, error %#lx.\n", GetLastError());
+    if (ret && wcsicmp(buffer, L"Ports")) check_class_guids(buffer, &GUID_DEVCLASS_PORTS, FALSE);
+
+    count = 0xdeadbeef;
+    ret = SetupDiClassGuidsFromNameW(L"WineNoSuchClass", guids, ARRAY_SIZE(guids), &count);
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(!count, "Got %lu GUIDs.\n", count);
+
+    count = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiClassGuidsFromNameW(L"Ports", NULL, 0, &count);
+    ok(!ret, "Expected failure.\n");
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "Got unexpected error %#lx.\n", GetLastError());
+    ok(count >= 1 && count != 0xdeadbeef, "Got %lu GUIDs.\n", count);
+
+    tmpfile[0] = '.';
+    tmpfile[1] = '\\';
+    get_temp_filename(tmpfile + 2);
+    create_file(tmpfile + 2, inf_data);
+    ret = SetupDiInstallClassA(NULL, tmpfile, 0, NULL);
+    DeleteFileA(tmpfile + 2);
+    if (!ret && GetLastError() == ERROR_ACCESS_DENIED)
+    {
+        skip("Not enough rights to install a class.\n");
+        return;
+    }
+    ok(ret, "Failed to install class, error %#lx.\n", GetLastError());
+
+    count = 0xdeadbeef;
+    ret = SetupDiClassGuidsFromNameW(L"WineTestNamedClass", guids, ARRAY_SIZE(guids), &count);
+    ok(ret, "Got error %#lx.\n", GetLastError());
+    ok(count == 1, "Got %lu GUIDs.\n", count);
+    if (count == 1) ok(IsEqualGUID(guids, &named_class), "Got class %s.\n", wine_dbgstr_guid(guids));
+    check_class_guids(L"Wine test named class", &named_class, FALSE);
+
+    /* a class whose name can't be read, enumerated first, doesn't end the search */
+    res = RegCreateKeyExW(HKEY_LOCAL_MACHINE, unnamed_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    ok(!res, "Failed to create class key, error %lu.\n", res);
+    RegCloseKey(key);
+    check_class_guids(L"WineTestNamedClass", &named_class, TRUE);
+    check_class_guids(L"Ports", &GUID_DEVCLASS_PORTS, TRUE);
+    res = RegDeleteKeyW(HKEY_LOCAL_MACHINE, unnamed_key);
+    ok(!res, "Failed to delete class key, error %lu.\n", res);
+
+    res = RegDeleteKeyW(HKEY_LOCAL_MACHINE, named_key);
+    ok(!res, "Failed to delete class key, error %lu.\n", res);
+}
+
+static void check_device_name_(int line, HDEVINFO set, SP_DEVINFO_DATA *device, const WCHAR *expect)
+{
+    WCHAR buffer[MAX_PATH];
+    DEVPROPTYPE type;
+    CONFIGRET cr;
+    DWORD size;
+    ULONG len;
+    BOOL ret;
+
+    type = 0xdeadbeef;
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDevicePropertyW(set, device, &DEVPKEY_NAME, &type, (BYTE *)buffer, sizeof(buffer), &size, 0);
+    if (expect)
+    {
+        ok_(__FILE__, line)(ret, "Failed to get DEVPKEY_NAME, error %#lx.\n", GetLastError());
+        ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "Got type %#lx.\n", type);
+        ok_(__FILE__, line)(size == (wcslen(expect) + 1) * sizeof(WCHAR), "Got size %lu.\n", size);
+        ok_(__FILE__, line)(ret && !wcscmp(buffer, expect), "Got name %s, expected %s.\n",
+                ret ? debugstr_w(buffer) : "(none)", debugstr_w(expect));
+    }
+    else
+    {
+        ok_(__FILE__, line)(!ret, "Got name %s.\n", debugstr_w(buffer));
+        ok_(__FILE__, line)(GetLastError() == ERROR_NOT_FOUND, "Got error %#lx.\n", GetLastError());
+    }
+
+    if (!pCM_Get_DevNode_PropertyW) return;
+    type = 0xdeadbeef;
+    len = sizeof(buffer);
+    cr = pCM_Get_DevNode_PropertyW(device->DevInst, &DEVPKEY_NAME, &type, (BYTE *)buffer, &len, 0);
+    if (expect)
+    {
+        ok_(__FILE__, line)(cr == CR_SUCCESS, "CM_Get_DevNode_PropertyW returned %#lx.\n", cr);
+        ok_(__FILE__, line)(type == DEVPROP_TYPE_STRING, "Got type %#lx.\n", type);
+        ok_(__FILE__, line)(!cr && !wcscmp(buffer, expect), "CM_Get_DevNode_PropertyW: got name %s, expected %s.\n",
+                cr ? "(none)" : debugstr_w(buffer), debugstr_w(expect));
+    }
+    else ok_(__FILE__, line)(cr == CR_NO_SUCH_VALUE, "CM_Get_DevNode_PropertyW returned %#lx.\n", cr);
+}
+#define check_device_name(a,b,c) check_device_name_(__LINE__,a,b,c)
+
+static void test_device_name(void)
+{
+    static const WCHAR desc[] = L"Wine test device", friendly[] = L"Wine test device (COM99)";
+    static const WCHAR stale[] = L"Stale name (COM98)";
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    HDEVINFO set;
+    BOOL ret;
+
+    pCM_Get_DevNode_PropertyW = (void *)GetProcAddress(LoadLibraryA("cfgmgr32.dll"), "CM_Get_DevNode_PropertyW");
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInfoW(set, L"Root\\LEGACY_BOGUS\\0000", &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+
+    /* the name of a device is its friendly name, or else its description */
+    check_device_name(set, &device, NULL);
+    ret = SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_DEVICEDESC, (const BYTE *)desc, sizeof(desc));
+    ok(ret, "Failed to set description, error %#lx.\n", GetLastError());
+    check_device_name(set, &device, desc);
+    ret = SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_FRIENDLYNAME, (const BYTE *)friendly, sizeof(friendly));
+    ok(ret, "Failed to set friendly name, error %#lx.\n", GetLastError());
+    check_device_name(set, &device, friendly);
+
+    /* it can't be set on its own; Wine lets drivers set it (winebth names its radios),
+     * and the friendly name still comes first */
+    SetLastError(0xdeadbeef);
+    ret = SetupDiSetDevicePropertyW(set, &device, &DEVPKEY_NAME, DEVPROP_TYPE_STRING, (const BYTE *)stale, sizeof(stale), 0);
+    todo_wine ok(!ret, "Expected failure.\n");
+    todo_wine ok(GetLastError() == ERROR_ACCESS_DENIED, "Got unexpected error %#lx.\n", GetLastError());
+    check_device_name(set, &device, friendly);
+
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 START_TEST(devinst)
 {
     static BOOL (WINAPI *pIsWow64Process)(HANDLE, BOOL *);
@@ -5648,11 +6441,14 @@ START_TEST(devinst)
     test_create_device_list_ex();
     test_open_class_key();
     test_install_class();
+    test_class_guids_from_name();
     test_device_info();
     test_device_property();
+    test_device_name();
     test_get_device_instance_id();
     test_open_device_info();
     test_register_device_info();
+    test_device_presence();
     test_device_iface();
     test_device_iface_detail();
     test_device_key();
@@ -5677,6 +6473,8 @@ START_TEST(devinst)
 
     test_copy_oem_inf(&ctx);
     test_driver_store(&ctx);
+    test_driver_properties(&ctx);
+    test_driver_properties_replace(&ctx);
 
     testsign_cleanup(&ctx);
 }

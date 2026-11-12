@@ -379,8 +379,6 @@ static void start_device( DEVICE_OBJECT *device, HDEVINFO set, SP_DEVINFO_DATA *
     load_function_driver( device, set, sp_device );
     if (device->DriverObject)
         send_pnp_irp( device, IRP_MN_START_DEVICE );
-
-    create_dyn_data_key( device );
 }
 
 static unsigned int hash_wchar_path( const WCHAR *id_path )
@@ -661,6 +659,10 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
         SetupDiSetDevicePropertyW( set, &sp_device, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
                 (BYTE *)parent_id, (wcslen( parent_id ) + 1) * sizeof(WCHAR), 0 );
 
+    /* The device is present from now on, even if no driver can be installed
+     * for it, and while it is being started. */
+    create_dyn_data_key( device );
+
     if (need_driver && !install_device_driver( device, set, &sp_device ) && !caps.RawDeviceOK)
     {
         ERR("Unable to install a function driver for device %s.\n", debugstr_w(device_instance_id));
@@ -687,9 +689,16 @@ static void send_remove_device_irp( DEVICE_OBJECT *device, UCHAR code )
     send_pnp_irp( device, code );
 }
 
-static void remove_device( DEVICE_OBJECT *device )
+static void delete_dyn_data_key( DEVICE_OBJECT *device )
 {
     struct wine_device *wine_device = CONTAINING_RECORD(device, struct wine_device, device_obj);
+
+    if (wine_device->children)
+    {
+        ULONG i;
+        for (i = 0; i < wine_device->children->Count; ++i)
+            delete_dyn_data_key( wine_device->children->Objects[i] );
+    }
 
     if (wine_device->dyn_data_key)
     {
@@ -697,6 +706,11 @@ static void remove_device( DEVICE_OBJECT *device )
         RegCloseKey( wine_device->dyn_data_key );
         wine_device->dyn_data_key = 0;
     }
+}
+
+static void remove_device( DEVICE_OBJECT *device )
+{
+    delete_dyn_data_key( device );
 
     send_remove_device_irp( device, IRP_MN_SURPRISE_REMOVAL );
     send_remove_device_irp( device, IRP_MN_REMOVE_DEVICE );
@@ -1366,6 +1380,7 @@ NTSTATUS WINAPI IoSetDeviceInterfaceState( UNICODE_STRING *name, BOOLEAN enable 
         NtClose( control_key );
         return ret;
     }
+    NtClose( control_key );
 
     iface->enabled = enable;
 
@@ -1462,11 +1477,16 @@ NTSTATUS WINAPI IoRegisterDeviceInterface(DEVICE_OBJECT *device, const GUID *cla
             && !SetupDiOpenDeviceInfoW( set, device_instance_id, NULL, 0, &sp_device ))
     {
         ERR("Failed to create device %s, error %#lx.\n", debugstr_w(device_instance_id), GetLastError());
-        return GetLastError();
+        status = GetLastError();
+        SetupDiDestroyDeviceInfoList( set );
+        return status;
     }
 
     if (!SetupDiCreateDeviceInterfaceW( set, &sp_device, class_guid, refstr ? refstr->Buffer : NULL, 0, &sp_iface ))
+    {
+        SetupDiDestroyDeviceInfoList( set );
         return STATUS_UNSUCCESSFUL;
+    }
 
     /* setupapi mangles the case; construct the interface path manually. */
 
@@ -1515,6 +1535,7 @@ NTSTATUS WINAPI IoRegisterDeviceInterface(DEVICE_OBJECT *device, const GUID *cla
         RtlDuplicateUnicodeString( 1, &device_path, symbolic_link );
 
     RtlFreeUnicodeString( &device_path );
+    SetupDiDestroyDeviceInfoList( set );
 
     return status;
 }
@@ -1879,6 +1900,7 @@ void CDECL wine_enumerate_root_devices( const WCHAR *driver_name )
                 sizeof(root_container_id) ))
             ERR("Failed to set container ID on root device %s.\n", debugstr_w(id));
 
+        create_dyn_data_key( device );
         start_device( device, set, &sp_device );
     }
 

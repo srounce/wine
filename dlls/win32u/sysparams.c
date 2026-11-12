@@ -2010,6 +2010,14 @@ static BOOL write_monitor_to_registry( struct monitor *monitor, const BYTE *edid
         NtClose( subkey );
     }
 
+    /* DEVPKEY_Device_IsPresent, monitors are only written to the registry while they are present */
+    if ((subkey = reg_create_ascii_key( hkey, devpropkey_device_ispresentA, 0, NULL )))
+    {
+        BOOL present = TRUE;
+        set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_BOOLEAN, &present, sizeof(present) );
+        NtClose( subkey );
+    }
+
     NtClose( hkey );
 
 

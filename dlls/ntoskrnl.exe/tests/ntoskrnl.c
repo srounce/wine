@@ -3308,6 +3308,367 @@ static void test_pnp_device_ids(void)
     UnregisterClassA("ntoskrnl_test_wc", GetModuleHandleA(NULL));
 }
 
+static BOOL cm_device_listed(const WCHAR *enumerator, const WCHAR *instance_id, ULONG flags)
+{
+    WCHAR *buffer, *id;
+    BOOL found = FALSE;
+    ULONG size = 0;
+    CONFIGRET cr;
+
+    if (enumerator) flags |= CM_GETIDLIST_FILTER_ENUMERATOR;
+    do
+    {
+        /* The list may grow between the two calls. */
+        cr = CM_Get_Device_ID_List_SizeW(&size, enumerator, flags);
+        ok(!cr, "Unexpected cr %#lx.\n", cr);
+        buffer = malloc(size * sizeof(*buffer));
+        cr = CM_Get_Device_ID_ListW(enumerator, buffer, size, flags);
+        if (cr == CR_BUFFER_SMALL) free(buffer);
+    } while (cr == CR_BUFFER_SMALL);
+    ok(!cr, "Unexpected cr %#lx.\n", cr);
+    for (id = buffer; !cr && *id; id += wcslen(id) + 1)
+        if (!wcsicmp(id, instance_id)) found = TRUE;
+    free(buffer);
+    return found;
+}
+
+static BOOL setupdi_device_listed(const WCHAR *enumerator, const WCHAR *instance_id, DWORD flags)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    WCHAR id[MAX_DEVICE_ID_LEN];
+    BOOL found = FALSE;
+    unsigned int i;
+    HDEVINFO set;
+    BOOL ret;
+
+    set = SetupDiGetClassDevsW(NULL, enumerator, NULL, DIGCF_ALLCLASSES | flags);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to get device list, error %#lx.\n", GetLastError());
+    for (i = 0; SetupDiEnumDeviceInfo(set, i, &device); ++i)
+    {
+        ret = SetupDiGetDeviceInstanceIdW(set, &device, id, ARRAY_SIZE(id), NULL);
+        ok(ret, "Failed to get device ID, error %#lx.\n", GetLastError());
+        if (!wcsicmp(id, instance_id)) found = TRUE;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
+#define check_device_presence(a, b) check_device_presence_(__LINE__, a, b)
+static void check_device_presence_(int line, const WCHAR *instance_id, BOOL present)
+{
+    BOOL cm_all, cm_all_enum, cm_present, cm_present_enum, setupdi_all, setupdi_present;
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    DEVPROP_BOOLEAN is_present = 0xcc;
+    WCHAR enumerator[MAX_DEVICE_ID_LEN];
+    DEVPROPTYPE type = 0xdeadbeef;
+    HDEVINFO set;
+    BOOL ret;
+
+    wcscpy(enumerator, instance_id);
+    *wcschr(enumerator, '\\') = 0;
+
+    /* Query everything first: the helpers call ok() themselves, which would
+     * override the location of the checks below. */
+    cm_all = cm_device_listed(NULL, instance_id, CM_GETIDLIST_FILTER_NONE);
+    cm_all_enum = cm_device_listed(enumerator, instance_id, CM_GETIDLIST_FILTER_NONE);
+    cm_present = cm_device_listed(NULL, instance_id, CM_GETIDLIST_FILTER_PRESENT);
+    cm_present_enum = cm_device_listed(enumerator, instance_id, CM_GETIDLIST_FILTER_PRESENT);
+    setupdi_all = setupdi_device_listed(enumerator, instance_id, 0);
+    setupdi_present = setupdi_device_listed(enumerator, instance_id, DIGCF_PRESENT);
+
+    ok_(__FILE__, line)(cm_all, "%s missing from CM_GETIDLIST_FILTER_NONE.\n", debugstr_w(instance_id));
+    ok_(__FILE__, line)(cm_all_enum, "%s missing from CM_GETIDLIST_FILTER_ENUMERATOR.\n", debugstr_w(instance_id));
+    ok_(__FILE__, line)(cm_present == present, "%s %s CM_GETIDLIST_FILTER_PRESENT.\n", debugstr_w(instance_id),
+            present ? "missing from" : "listed in");
+    ok_(__FILE__, line)(cm_present_enum == present, "%s %s CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT.\n",
+            debugstr_w(instance_id), present ? "missing from" : "listed in");
+    ok_(__FILE__, line)(setupdi_all, "%s missing from SetupDiGetClassDevs().\n", debugstr_w(instance_id));
+    ok_(__FILE__, line)(setupdi_present == present, "%s %s SetupDiGetClassDevs(DIGCF_PRESENT).\n",
+            debugstr_w(instance_id), present ? "missing from" : "listed in");
+
+    set = SetupDiCreateDeviceInfoList(NULL, NULL);
+    ok_(__FILE__, line)(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    ret = SetupDiOpenDeviceInfoW(set, instance_id, NULL, 0, &device);
+    ok_(__FILE__, line)(ret, "Failed to open %s, error %#lx.\n", debugstr_w(instance_id), GetLastError());
+    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_IsPresent, &type, (BYTE *)&is_present,
+            sizeof(is_present), NULL, 0);
+    ok_(__FILE__, line)(ret, "Failed to get DEVPKEY_Device_IsPresent, error %#lx.\n", GetLastError());
+    ok_(__FILE__, line)(type == DEVPROP_TYPE_BOOLEAN, "Got type %#lx.\n", type);
+    ok_(__FILE__, line)(is_present == (present ? DEVPROP_TRUE : DEVPROP_FALSE), "Got IsPresent %#x.\n", is_present);
+    SetupDiDestroyDeviceInfoList(set);
+}
+
+static BOOL wait_device_present(const WCHAR *instance_id, BOOL present)
+{
+    DWORD start_time = GetTickCount();
+
+    while (cm_device_listed(NULL, instance_id, CM_GETIDLIST_FILTER_PRESENT) != present)
+    {
+        if (GetTickCount() - start_time >= 5000) return FALSE;
+        Sleep(50);
+    }
+    return TRUE;
+}
+
+/* Wine keeps one HKEY_DYN_DATA\Config Manager\Enum key per present device. */
+static unsigned int count_dyn_data_keys(const WCHAR *instance_id)
+{
+    WCHAR name[64], value[MAX_DEVICE_ID_LEN];
+    unsigned int count = 0;
+    DWORD i, size;
+    HKEY key, subkey;
+
+    if (RegOpenKeyExW(HKEY_DYN_DATA, L"Config Manager\\Enum", 0, KEY_READ, &key)) return 0;
+    for (i = 0; ; ++i)
+    {
+        size = ARRAY_SIZE(name);
+        if (RegEnumKeyExW(key, i, name, &size, NULL, NULL, NULL, NULL)) break;
+        if (RegOpenKeyExW(key, name, 0, KEY_READ, &subkey)) continue;
+        size = sizeof(value);
+        if (!RegQueryValueExW(subkey, L"HardWareKey", NULL, NULL, (BYTE *)value, &size) && !wcsicmp(value, instance_id))
+            ++count;
+        RegCloseKey(subkey);
+    }
+    RegCloseKey(key);
+    return count;
+}
+
+/* The descendants of a removed device are removed with it. They stay in the
+ * registry, but they are not present anymore. */
+static void test_pnp_subtree_presence(HANDLE bus)
+{
+    static const struct bus_device_desc subtree_desc[3] =
+    {
+        {
+            .dev_name = L"winetest_pnp_subtree_1",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_1",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+        {
+            .dev_name = L"winetest_pnp_subtree_2",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_2",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+        {
+            .dev_name = L"winetest_pnp_subtree_3",
+            .hardware_ids_str = L"test_tree_hardware_id\0",
+            .device_id_str = L"WINEPNPTEST\\SUBTREE_3",
+            .instance_id_str = L"00",
+            .unique_id = TRUE,
+        },
+    };
+    static const WCHAR *subtree_id[3] =
+    {
+        L"WINEPNPTEST\\SUBTREE_1\\00",
+        L"WINEPNPTEST\\SUBTREE_2\\00",
+        L"WINEPNPTEST\\SUBTREE_3\\00",
+    };
+    struct pnp_bus_device_data parent[2];
+    struct bus_device_desc desc[3];
+    unsigned int i, count;
+
+    /* Three levels below the bus: removing the first one removes all of them. */
+    for (i = 0; i < 3; ++i)
+    {
+        desc[i] = subtree_desc[i];
+        pnp_bus_test_device_add_child(i ? parent[i - 1].handle : bus, &desc[i], i + 1);
+        if (i < 2) get_pnp_bus_device_data(i + 1, desc[i].dev_name, &parent[i]);
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], TRUE);
+        winetest_pop_context();
+    }
+
+    for (i = 0; i < 2; ++i) pnp_bus_device_data_close(&parent[i]);
+    pnp_bus_test_device_remove_child(bus, &desc[0], 1);
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], FALSE);
+        if (winetest_platform_is_wine)
+        {
+            count = count_dyn_data_keys(subtree_id[i]);
+            ok(!count, "Got %u keys.\n", count);
+        }
+        winetest_pop_context();
+    }
+
+    /* Plugging the first level again does not bring back the levels below it,
+     * until its driver reports them again. */
+    pnp_bus_test_device_add_child(bus, &desc[0], 1);
+    check_device_presence(subtree_id[0], TRUE);
+    check_device_presence(subtree_id[1], FALSE);
+    check_device_presence(subtree_id[2], FALSE);
+    for (i = 1; i < 3; ++i)
+    {
+        get_pnp_bus_device_data(i, desc[i - 1].dev_name, &parent[i - 1]);
+        pnp_bus_test_device_add_child(parent[i - 1].handle, &desc[i], i + 1);
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], TRUE);
+        if (winetest_platform_is_wine)
+        {
+            count = count_dyn_data_keys(subtree_id[i]);
+            ok(count == 1, "Got %u keys.\n", count);
+        }
+        winetest_pop_context();
+    }
+
+    for (i = 0; i < 2; ++i) pnp_bus_device_data_close(&parent[i]);
+    pnp_bus_test_device_remove_child(bus, &desc[0], 1);
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context("level %u", i + 1);
+        check_device_presence(subtree_id[i], FALSE);
+        winetest_pop_context();
+    }
+}
+
+static void test_pnp_device_presence(void)
+{
+    DEV_BROADCAST_DEVICEINTERFACE_A filter =
+    {
+        .dbcc_size = sizeof(filter),
+        .dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE,
+    };
+    static const WNDCLASSA class =
+    {
+        .lpszClassName = "ntoskrnl_test_wc",
+        .lpfnWndProc = pnp_device_ids_notify_proc,
+    };
+    static const struct bus_device_desc started_desc =
+    {
+        .dev_name = L"winetest_pnp_child_present",
+        .hardware_ids_str = L"test_tree_hardware_id\0",
+        .device_id_str = L"WINEPNPTEST\\PRESENT_00",
+        .instance_id_str = L"00",
+        .unique_id = TRUE,
+    };
+    static const struct bus_device_desc no_driver_desc =
+    {
+        .dev_name = L"winetest_pnp_child_no_driver",
+        .hardware_ids_str = L"winetest_no_driver_hardware_id\0",
+        .device_id_str = L"WINEPNPTEST\\NO_DRIVER_00",
+        .instance_id_str = L"00",
+        .unique_id = TRUE,
+    };
+    static const struct bus_device_desc mixed_case_desc =
+    {
+        .dev_name = L"winetest_pnp_child_mixed_case",
+        .hardware_ids_str = L"winetest_no_driver_hardware_id\0",
+        .device_id_str = L"WINEPNPTEST\\Mixed_Case_00",
+        .instance_id_str = L"Ab",
+        .unique_id = TRUE,
+    };
+    static const struct bus_device_desc hold_start_desc =
+    {
+        .dev_name = L"winetest_pnp_child_hold_start",
+        .hardware_ids_str = L"test_tree_hardware_id\0",
+        .device_id_str = L"WINEPNPTEST\\HOLD_START_00",
+        .instance_id_str = L"00",
+        .unique_id = TRUE,
+        .hold_start = TRUE,
+    };
+    struct pnp_bus_device_data bus_dev;
+    struct bus_device_desc desc;
+    HANDLE entered, release;
+    HDEVNOTIFY notify_handle;
+    GUID child_class;
+    DWORD status;
+    HWND hwnd;
+    BOOL ret;
+
+    ret = RegisterClassA(&class);
+    ok(ret, "Failed to register window class, error %lu.\n", GetLastError());
+    hwnd = CreateWindowA("ntoskrnl_test_wc", NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+    ok(!!hwnd, "Failed to create hwnd, error %lu.\n", GetLastError());
+    notify_handle = RegisterDeviceNotificationA(hwnd, &filter, DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+    ok(!!notify_handle, "failed to register window, error %lu\n", GetLastError());
+    get_child_level_iface_class(1, &child_class);
+
+    get_pnp_bus_device_data(0, L"", &bus_dev);
+    check_device_presence(bus_dev.instance_id, TRUE);
+
+    /* A removed device stays in the registry, but is not present anymore. */
+    desc = started_desc;
+    pnp_bus_test_device_add_child(bus_dev.handle, &desc, 1);
+    check_device_presence(L"WINEPNPTEST\\PRESENT_00\\00", TRUE);
+    pnp_bus_test_device_remove_child(bus_dev.handle, &desc, 1);
+    check_device_presence(L"WINEPNPTEST\\PRESENT_00\\00", FALSE);
+
+    pnp_bus_test_device_add_child(bus_dev.handle, &desc, 1);
+    check_device_presence(L"WINEPNPTEST\\PRESENT_00\\00", TRUE);
+    pnp_bus_test_device_remove_child(bus_dev.handle, &desc, 1);
+    check_device_presence(L"WINEPNPTEST\\PRESENT_00\\00", FALSE);
+
+    /* A device without a function driver and without RawDeviceOK is never
+     * started (problem CM_PROB_FAILED_INSTALL), but it is present. */
+    desc = no_driver_desc;
+    ret = DeviceIoControl(bus_dev.handle, IOCTL_WINETEST_BUS_ADD_CHILD, &desc, sizeof(desc), NULL, 0, NULL, NULL);
+    ok(ret, "Got error %lu.\n", GetLastError());
+    ret = wait_device_present(L"WINEPNPTEST\\NO_DRIVER_00\\00", TRUE);
+    ok(ret, "Device without a driver is not present.\n");
+    check_device_presence(L"WINEPNPTEST\\NO_DRIVER_00\\00", TRUE);
+    ret = DeviceIoControl(bus_dev.handle, IOCTL_WINETEST_BUS_REMOVE_CHILD, desc.dev_name, sizeof(desc.dev_name),
+            NULL, 0, NULL, NULL);
+    ok(ret, "Got error %lu.\n", GetLastError());
+    ret = wait_device_present(L"WINEPNPTEST\\NO_DRIVER_00\\00", FALSE);
+    ok(ret, "Removed device without a driver is still present.\n");
+    check_device_presence(L"WINEPNPTEST\\NO_DRIVER_00\\00", FALSE);
+
+    /* Device and instance IDs are not case sensitive. */
+    desc = mixed_case_desc;
+    ret = DeviceIoControl(bus_dev.handle, IOCTL_WINETEST_BUS_ADD_CHILD, &desc, sizeof(desc), NULL, 0, NULL, NULL);
+    ok(ret, "Got error %lu.\n", GetLastError());
+    ret = wait_device_present(L"WINEPNPTEST\\Mixed_Case_00\\Ab", TRUE);
+    ok(ret, "Device with a mixed case ID is not present.\n");
+    check_device_presence(L"WINEPNPTEST\\Mixed_Case_00\\Ab", TRUE);
+    ret = DeviceIoControl(bus_dev.handle, IOCTL_WINETEST_BUS_REMOVE_CHILD, desc.dev_name, sizeof(desc.dev_name),
+            NULL, 0, NULL, NULL);
+    ok(ret, "Got error %lu.\n", GetLastError());
+    ret = wait_device_present(L"WINEPNPTEST\\Mixed_Case_00\\Ab", FALSE);
+    ok(ret, "Removed device with a mixed case ID is still present.\n");
+    check_device_presence(L"WINEPNPTEST\\Mixed_Case_00\\Ab", FALSE);
+
+    /* A device is present before IRP_MN_START_DEVICE completes. */
+    entered = CreateEventW(NULL, FALSE, FALSE, L"Global\\winetest_pnp_start_entered");
+    ok(!!entered, "Failed to create event, error %lu.\n", GetLastError());
+    release = CreateEventW(NULL, FALSE, FALSE, L"Global\\winetest_pnp_start_release");
+    ok(!!release, "Failed to create event, error %lu.\n", GetLastError());
+    desc = hold_start_desc;
+    ret = DeviceIoControl(bus_dev.handle, IOCTL_WINETEST_BUS_ADD_CHILD, &desc, sizeof(desc), NULL, 0, NULL, NULL);
+    ok(ret, "Got error %lu.\n", GetLastError());
+    status = WaitForSingleObject(entered, 5000);
+    ok(!status, "Got status %#lx.\n", status);
+    if (!status)
+    {
+        check_device_presence(L"WINEPNPTEST\\HOLD_START_00\\00", TRUE);
+        SetEvent(release);
+    }
+    pnp_device_watch(&child_class);
+    ok(pnp_device_watch_arrived, "Expected device arrival.\n");
+    check_device_presence(L"WINEPNPTEST\\HOLD_START_00\\00", TRUE);
+    pnp_bus_test_device_remove_child(bus_dev.handle, &desc, 1);
+    check_device_presence(L"WINEPNPTEST\\HOLD_START_00\\00", FALSE);
+    CloseHandle(entered);
+    CloseHandle(release);
+
+    test_pnp_subtree_presence(bus_dev.handle);
+
+    pnp_bus_device_data_close(&bus_dev);
+    UnregisterDeviceNotification(notify_handle);
+    DestroyWindow(hwnd);
+    UnregisterClassA("ntoskrnl_test_wc", GetModuleHandleA(NULL));
+}
+
 static void test_pnp_tree_driver(struct testsign_context *ctx)
 {
     static const char tree_hardware_id[] = "test_tree_hardware_id\0";
@@ -3394,6 +3755,7 @@ static void test_pnp_tree_driver(struct testsign_context *ctx)
 
     /* Tests. */
     test_pnp_device_ids();
+    test_pnp_device_presence();
 
     /* Clean up. */
 

@@ -108,6 +108,10 @@ struct bus_device_desc
     BOOL unique_id;
     ULONG address;
     ULONG ui_number;
+
+    /* Signal winetest_pnp_start_entered and wait for winetest_pnp_start_release
+     * in IRP_MN_START_DEVICE, after enabling the interface. */
+    BOOL hold_start;
 };
 
 static const GUID control_class = {0xdeadbeef, 0x29ef, 0x4538, {0xa5, 0xfd, 0xb6, 0x95, 0x73, 0xa3, 0x62, 0xc0}};

@@ -686,16 +686,6 @@ static const struct property_desc device_properties[] =
     { &DEVPKEY_Device_FirstInstallDate,             DEVPROP_TYPE_FILETIME },
     { &DEVPKEY_Device_LastArrivalDate,              DEVPROP_TYPE_FILETIME },
     { &DEVPKEY_Device_LastRemovalDate,              DEVPROP_TYPE_FILETIME },
-    { &DEVPKEY_Device_DriverDate,                   DEVPROP_TYPE_FILETIME,                      L"DriverDateData" },
-    { &DEVPKEY_Device_DriverVersion,                DEVPROP_TYPE_STRING,                        L"DriverVersion" },
-    { &DEVPKEY_Device_DriverDesc,                   DEVPROP_TYPE_STRING,                        L"DriverDesc" },
-    { &DEVPKEY_Device_DriverInfPath,                DEVPROP_TYPE_STRING,                        L"InfPath" },
-    { &DEVPKEY_Device_DriverInfSection,             DEVPROP_TYPE_STRING,                        L"InfSection" },
-    { &DEVPKEY_Device_DriverInfSectionExt,          DEVPROP_TYPE_STRING,                        L"InfSectionExt" },
-    { &DEVPKEY_Device_MatchingDeviceId,             DEVPROP_TYPE_STRING,                        L"MatchingDeviceId" },
-    { &DEVPKEY_Device_DriverProvider,               DEVPROP_TYPE_STRING,                        L"ProviderName" },
-    { &DEVPKEY_Device_DriverPropPageProvider,       DEVPROP_TYPE_STRING,                        L"EnumPropPages32" },
-    { &DEVPKEY_Device_DriverCoInstallers,           DEVPROP_TYPE_STRING_LIST,                   L"CoInstallers32" },
     { &DEVPKEY_Device_ResourcePickerTags,           DEVPROP_TYPE_STRING,                        L"ResourcePickerTags" },
     { &DEVPKEY_Device_ResourcePickerExceptions,     DEVPROP_TYPE_STRING,                        L"ResourcePickerExceptions" },
     { &DEVPKEY_Device_DriverRank,                   DEVPROP_TYPE_UINT32 },
@@ -707,10 +697,139 @@ static const struct property_desc device_properties[] =
     { &DEVPKEY_Device_SafeRemovalRequiredOverride,  DEVPROP_TYPE_BOOLEAN },
 };
 
+/* Properties of the driver installed for a device, which setupapi stores in the driver key of the device, and also
+ * as properties of the device. */
+static const struct property_desc driver_properties[] =
+{
+    { &DEVPKEY_Device_DriverDate,                   DEVPROP_TYPE_FILETIME,                      L"DriverDateData" },
+    { &DEVPKEY_Device_DriverVersion,                DEVPROP_TYPE_STRING,                        L"DriverVersion" },
+    { &DEVPKEY_Device_DriverDesc,                   DEVPROP_TYPE_STRING,                        L"DriverDesc" },
+    { &DEVPKEY_Device_DriverInfPath,                DEVPROP_TYPE_STRING,                        L"InfPath" },
+    { &DEVPKEY_Device_DriverInfSection,             DEVPROP_TYPE_STRING,                        L"InfSection" },
+    { &DEVPKEY_Device_DriverInfSectionExt,          DEVPROP_TYPE_STRING,                        L"InfSectionExt" },
+    { &DEVPKEY_Device_MatchingDeviceId,             DEVPROP_TYPE_STRING,                        L"MatchingDeviceId" },
+    { &DEVPKEY_Device_DriverProvider,               DEVPROP_TYPE_STRING,                        L"ProviderName" },
+    { &DEVPKEY_Device_DriverPropPageProvider,       DEVPROP_TYPE_STRING,                        L"EnumPropPages32" },
+    { &DEVPKEY_Device_DriverCoInstallers,           DEVPROP_TYPE_STRING_LIST,                   L"CoInstallers32" },
+};
+
+/* ntoskrnl creates a volatile key with the instance ID of each device it
+ * has enumerated, and deletes it when the device is removed. */
+static WCHAR *get_enumerated_devices(void)
+{
+    WCHAR name[16], id[MAX_DEVICE_ID_LEN], *ret, *tmp;
+    UINT len = 0, capacity = 256;
+    DWORD size, type;
+    HKEY root, hkey;
+
+    if (!(ret = malloc( capacity * sizeof(*ret) ))) return NULL;
+    *ret = 0;
+    if (RegOpenKeyExW( HKEY_DYN_DATA, L"Config Manager\\Enum", 0, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &root ))
+        return ret;
+
+    for (UINT i = 0; !RegEnumKeyW( root, i, name, ARRAY_SIZE(name) ); i++)
+    {
+        if (RegOpenKeyExW( root, name, 0, KEY_QUERY_VALUE, &hkey )) continue;
+        size = sizeof(id) - sizeof(WCHAR);
+        if (RegQueryValueExW( hkey, L"HardWareKey", NULL, &type, (BYTE *)id, &size ) || type != REG_SZ) size = 0;
+        RegCloseKey( hkey );
+        if (!size) continue;
+        id[size / sizeof(WCHAR)] = 0; /* ntoskrnl doesn't store the terminator */
+
+        size = wcslen( id ) + 1;
+        if (len + size + 1 > capacity)
+        {
+            capacity = max( capacity * 2, len + size + 1 );
+            if (!(tmp = realloc( ret, capacity * sizeof(*ret) )))
+            {
+                free( ret );
+                ret = NULL;
+                break;
+            }
+            ret = tmp;
+        }
+        wcscpy( ret + len, id );
+        len += size;
+        ret[len] = 0;
+    }
+
+    RegCloseKey( root );
+    return ret;
+}
+
+static BOOL device_is_present( HKEY hkey, const struct device *dev, const WCHAR *enumerated )
+{
+    DWORD value = 0, size = sizeof(value);
+    WCHAR path[MAX_DEVICE_ID_LEN];
+    struct property prop;
+    DEVPROPTYPE type;
+    UINT len, id_len;
+
+    /* The root enumerator is the registry itself: like on Windows, a root
+     * device is present once registered, even without a driver. */
+    if (!wcsicmp( dev->enumerator, L"ROOT" ))
+        return RegQueryValueExW( hkey, L"Phantom", NULL, NULL, (BYTE *)&value, &size ) || !value;
+
+    len = swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\%s", dev->enumerator, dev->device, dev->instance );
+    for (const WCHAR *id = enumerated; *id; id += id_len + 1)
+        if ((id_len = wcslen( id )) == len && !wcsicmp( id, path )) return TRUE;
+
+    /* Devices which aren't enumerated by ntoskrnl, such as the GPUs and monitors
+     * from win32u, have DEVPKEY_Device_IsPresent set by their creator. */
+    init_property( &prop, &DEVPKEY_Device_IsPresent, &type, &value, &size, FALSE );
+    return !query_property( hkey, L"Properties\\", DEVPROP_TYPE_BOOLEAN, &prop ) && value;
+}
+
+/* Like on Windows, the properties of the driver are device properties, and when there are none, such as for a
+ * device installed before they were stored, they are the values of the driver key. */
+static LSTATUS query_driver_property( HKEY hkey, const struct property_desc *desc, struct property *prop )
+{
+    WCHAR driver[MAX_PATH];
+    DWORD size = sizeof(driver), capacity = *prop->size;
+    LSTATUS err;
+    HKEY driver_key;
+
+    if ((err = query_property( hkey, L"Properties\\", desc->type, prop )) != ERROR_NOT_FOUND) return err;
+
+    *prop->size = capacity;
+    if (RegQueryValueExW( hkey, L"Driver", NULL, NULL, (BYTE *)driver, &size )) return ERROR_NOT_FOUND;
+    if (open_class_key( HKEY_LOCAL_MACHINE, driver, KEY_QUERY_VALUE, TRUE, &driver_key )) return ERROR_NOT_FOUND;
+    err = query_named_property( driver_key, desc->name, desc->type, prop );
+    RegCloseKey( driver_key );
+    return err;
+}
+
 static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struct property *prop )
 {
     if (!memcmp( &DEVPKEY_Device_InstanceId, &prop->key, sizeof(prop->key) ))
         return return_property_string( prop, dev->instance );
+
+    if (!memcmp( &DEVPKEY_Device_IsPresent, &prop->key, sizeof(prop->key) ))
+    {
+        WCHAR *enumerated;
+        BOOL present;
+
+        if (!(enumerated = get_enumerated_devices())) return ERROR_OUTOFMEMORY;
+        present = device_is_present( hkey, dev, enumerated );
+        free( enumerated );
+        return return_property_bool( prop, present ? DEVPROP_TRUE : DEVPROP_FALSE );
+    }
+
+    /* like on Windows, the name of a device is its friendly name, or its description; a name set by its
+     * driver comes in between */
+    if (!memcmp( &DEVPKEY_NAME, &prop->key, sizeof(prop->key) ))
+    {
+        DWORD size = *prop->size;
+        LSTATUS err;
+
+        if ((err = query_named_property( hkey, L"FriendlyName", DEVPROP_TYPE_STRING, prop )) != ERROR_NOT_FOUND)
+            return err;
+        *prop->size = size;
+        if ((err = query_property( hkey, L"Properties\\", DEVPROP_TYPE_STRING, prop )) != ERROR_NOT_FOUND)
+            return err;
+        *prop->size = size;
+        return query_named_property( hkey, L"DeviceDesc", DEVPROP_TYPE_STRING, prop );
+    }
 
     for (UINT i = 0; i < ARRAY_SIZE(device_properties); i++)
     {
@@ -718,6 +837,12 @@ static LSTATUS query_device_property( HKEY hkey, const struct device *dev, struc
         if (memcmp( desc->key, &prop->key, sizeof(prop->key) )) continue;
         if (!desc->name) return query_property( hkey, L"Properties\\", desc->type, prop );
         return query_named_property( hkey, desc->name, desc->type, prop );
+    }
+
+    for (UINT i = 0; i < ARRAY_SIZE(driver_properties); i++)
+    {
+        const struct property_desc *desc = driver_properties + i;
+        if (!memcmp( desc->key, &prop->key, sizeof(prop->key) )) return query_driver_property( hkey, desc, prop );
     }
 
     if (!memcmp( &DEVPKEY_Device_DeviceDesc, &prop->key, sizeof(prop->key.fmtid) ))
@@ -748,7 +873,9 @@ LSTATUS enum_device_property_keys( HKEY hkey, const struct device *dev, DEVPROPK
 {
     ULONG capacity = *size, count = 0;
     LSTATUS err = ERROR_SUCCESS;
-    HKEY props_key;
+    HKEY props_key, driver_key;
+    WCHAR driver[MAX_PATH];
+    DWORD driver_len = sizeof(driver);
 
     if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
     else buffer[count - 1] = DEVPKEY_Device_InstanceId;
@@ -761,6 +888,21 @@ LSTATUS enum_device_property_keys( HKEY hkey, const struct device *dev, DEVPROPK
             if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
             else buffer[count - 1] = *desc->key;
         }
+    }
+
+    if (!RegQueryValueExW( hkey, L"Driver", NULL, NULL, (BYTE *)driver, &driver_len ) &&
+        !open_class_key( HKEY_LOCAL_MACHINE, driver, KEY_QUERY_VALUE, TRUE, &driver_key ))
+    {
+        for (UINT i = 0; i < ARRAY_SIZE(driver_properties); i++)
+        {
+            const struct property_desc *desc = driver_properties + i;
+            if (!RegQueryValueExW( driver_key, desc->name, NULL, NULL, NULL, NULL ))
+            {
+                if (capacity < ++count || !buffer) err = ERROR_MORE_DATA;
+                else buffer[count - 1] = *desc->key;
+            }
+        }
+        RegCloseKey( driver_key );
     }
 
     if (!open_key( hkey, L"Properties", KEY_ENUMERATE_SUB_KEYS, TRUE, &props_key ))
@@ -819,8 +961,9 @@ static LSTATUS matches_device_property( HKEY hkey, struct device *dev, const DEV
     return wcsicmp( buffer, value ) ? ERROR_NO_MATCH : ERROR_SUCCESS;
 }
 
+/* enumerated is the list from get_enumerated_devices() to only enumerate present devices, or NULL for all */
 static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPROPKEY *key, const WCHAR *value,
-                                      BOOL all, enum_objects_cb callback, void *context )
+                                      const WCHAR *enumerated, enum_objects_cb callback, void *context )
 {
     LSTATUS err = ERROR_SUCCESS;
     HKEY hkey;
@@ -830,7 +973,7 @@ static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPR
     {
         if ((err = open_key( root, dev->instance, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, TRUE, &hkey ))) break;
         if ((err = matches_device_property( hkey, dev, key, value )) == ERROR_NO_MATCH) err = ERROR_SUCCESS;
-        else if (!err)
+        else if (!err && (!enumerated || device_is_present( hkey, dev, enumerated )))
         {
             WCHAR path[MAX_PATH];
             len = swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\%s", dev->enumerator, dev->device, dev->instance );
@@ -844,7 +987,7 @@ static LSTATUS enum_device_instances( HKEY root, struct device *dev, const DEVPR
 }
 
 static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCHAR *device, const DEVPROPKEY *key,
-                                        const WCHAR *prop, BOOL all, enum_objects_cb callback, void *context )
+                                        const WCHAR *prop, const WCHAR *enumerated, enum_objects_cb callback, void *context )
 {
     LSTATUS err = ERROR_SUCCESS;
     HKEY hkey;
@@ -853,7 +996,7 @@ static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCH
     {
         if (device && wcsicmp( dev->device, device )) continue;
         if ((err = open_key( root, dev->device, KEY_ENUMERATE_SUB_KEYS, TRUE, &hkey ))) break;
-        err = enum_device_instances( hkey, dev, key, prop, all, callback, context );
+        err = enum_device_instances( hkey, dev, key, prop, enumerated, callback, context );
         RegCloseKey( hkey );
     }
     if (err == ERROR_NO_MORE_ITEMS) err = ERROR_SUCCESS;
@@ -863,7 +1006,7 @@ static LSTATUS enum_enumerator_devices( HKEY root, struct device *dev, const WCH
 
 static LSTATUS enum_devices( const WCHAR *filter, const DEVPROPKEY *key, const WCHAR *value, BOOL all, enum_objects_cb callback, void *context )
 {
-    WCHAR enumerator[MAX_PATH], *device = NULL;
+    WCHAR enumerator[MAX_PATH], *device = NULL, *enumerated = NULL;
     LSTATUS err = ERROR_SUCCESS;
     struct device dev;
     HKEY root, hkey;
@@ -879,15 +1022,17 @@ static LSTATUS enum_devices( const WCHAR *filter, const DEVPROPKEY *key, const W
 
     root = cache_root_key( HKEY_LOCAL_MACHINE, enum_rootW, NULL );
     if (root == (HKEY)-1) return ERROR_FILE_NOT_FOUND;
+    if (!all && !(enumerated = get_enumerated_devices())) return ERROR_OUTOFMEMORY;
 
     for (UINT i = 0; !err && !(err = RegEnumKeyW( root, i, dev.enumerator, ARRAY_SIZE(dev.enumerator) )); i++)
     {
         if (filter && wcsicmp( dev.enumerator, enumerator )) continue;
         if ((err = open_key( root, dev.enumerator, KEY_ENUMERATE_SUB_KEYS, TRUE, &hkey ))) break;
-        err = enum_enumerator_devices( hkey, &dev, device, key, value, all, callback, context );
+        err = enum_enumerator_devices( hkey, &dev, device, key, value, enumerated, callback, context );
         RegCloseKey( hkey );
     }
     if (err == ERROR_NO_MORE_ITEMS) err = ERROR_SUCCESS;
+    free( enumerated );
 
     if (!err) callback( NULL, NULL, L"", 1, context );
     return err;
