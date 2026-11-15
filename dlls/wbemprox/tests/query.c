@@ -1366,6 +1366,585 @@ static void test_notification_query_async( IWbemServices *services )
     SysFreeString( query );
 }
 
+/* Win32_DeviceChangeEvent: the subscription stays pending until it is cancelled and delivers one
+ * object per device change, like the event consumers in .NET (ManagementEventWatcher) expect. */
+
+#define MAX_DC_EVENTS 512
+
+struct dc_event
+{
+    DWORD tick;
+    LONG  type;       /* EventType, -1 if missing */
+    BOOL  class_ok;   /* __CLASS is Win32_SystemConfigurationChangeEvent */
+    BOOL  time_ok;    /* TIME_CREATED is a non-empty string */
+    LONG  present;    /* matching Win32_PnPEntity instances, read inside Indicate; -1 = not checked */
+};
+
+struct dc_sink
+{
+    IWbemObjectSink IWbemObjectSink_iface;
+    LONG refs;
+    LONG objects;
+    LONG status_calls;
+    LONG status_flags;
+    HRESULT status_hr;
+    BOOL cancelled;
+    LONG after_cancel;
+    IWbemServices *services;  /* re-entrant Win32_PnPEntity query from Indicate */
+    const WCHAR *device;      /* upper case DeviceID substring, e.g. VID_239A&PID_CAFE */
+    struct dc_cancel *cancel; /* cancel test, see dc_cancel_thread */
+    IWbemClassObject *first;
+    WCHAR first_class[64];
+    CRITICAL_SECTION cs;
+    LONG count;
+    struct dc_event events[MAX_DC_EVENTS];
+};
+
+/* CancelAsyncCall from Indicate, or from another thread while Indicate is busy (an EventArrived handler
+ * waiting for the thread that stops the .NET ManagementEventWatcher) */
+struct dc_cancel
+{
+    struct dc_sink sink;
+    BOOL from_indicate;
+    IWbemServices *services;
+    HANDLE thread, subscribed, in_indicate, release, done;
+    HRESULT subscribe_hr, cancel_hr;
+    DWORD cancel_ms;
+    LONG objects_at_cancel;  /* Indicate calls when CancelAsyncCall returned */
+    LONG status_while_busy;  /* SetStatus calls before the busy Indicate returned */
+};
+
+static inline struct dc_sink *impl_from_dc_sink( IWbemObjectSink *iface )
+{
+    return CONTAINING_RECORD( iface, struct dc_sink, IWbemObjectSink_iface );
+}
+
+static void dc_cancel_indicate( struct dc_cancel *t )
+{
+    DWORD start;
+
+    if (InterlockedIncrement( &t->sink.objects ) > 1) return;
+    if (t->from_indicate)
+    {
+        start = GetTickCount();
+        t->cancel_hr = IWbemServices_CancelAsyncCall( t->services, &t->sink.IWbemObjectSink_iface );
+        t->cancel_ms = GetTickCount() - start;
+        t->objects_at_cancel = t->sink.objects;
+        SetEvent( t->done );
+    }
+    else
+    {
+        SetEvent( t->in_indicate );
+        WaitForSingleObject( t->release, 5000 );
+        t->status_while_busy = t->sink.status_calls;
+    }
+}
+
+static HRESULT WINAPI dc_sink_QueryInterface( IWbemObjectSink *iface, REFIID riid, void **ppv )
+{
+    *ppv = NULL;
+    if (IsEqualGUID( &IID_IUnknown, riid ) || IsEqualGUID( &IID_IWbemObjectSink, riid ))
+    {
+        *ppv = iface;
+        IWbemObjectSink_AddRef( iface );
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI dc_sink_AddRef( IWbemObjectSink *iface )
+{
+    return InterlockedIncrement( &impl_from_dc_sink( iface )->refs );
+}
+
+static ULONG WINAPI dc_sink_Release( IWbemObjectSink *iface )
+{
+    return InterlockedDecrement( &impl_from_dc_sink( iface )->refs );
+}
+
+static LONG count_devices( IWbemServices *services, const WCHAR *device )
+{
+    BSTR wql = SysAllocString( L"wql" ), query = SysAllocString( L"SELECT * FROM Win32_PnPEntity" );
+    IEnumWbemClassObject *result;
+    IWbemClassObject *obj;
+    LONG count = 0;
+    ULONG n;
+    HRESULT hr;
+
+    hr = IWbemServices_ExecQuery( services, wql, query, WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY,
+                                  NULL, &result );
+    if (hr != S_OK) count = -2;
+    else
+    {
+        for (;;)
+        {
+            VARIANT var;
+
+            n = 0;
+            IEnumWbemClassObject_Next( result, 10000, 1, &obj, &n );
+            if (!n) break;
+            VariantInit( &var );
+            if (IWbemClassObject_Get( obj, L"DeviceID", 0, &var, NULL, NULL ) == S_OK && V_VT( &var ) == VT_BSTR)
+            {
+                CharUpperW( V_BSTR( &var ) );
+                if (wcsstr( V_BSTR( &var ), device )) count++;
+            }
+            VariantClear( &var );
+            IWbemClassObject_Release( obj );
+        }
+        IEnumWbemClassObject_Release( result );
+    }
+    SysFreeString( wql );
+    SysFreeString( query );
+    return count;
+}
+
+static HRESULT WINAPI dc_sink_Indicate( IWbemObjectSink *iface, LONG count, IWbemClassObject **objects )
+{
+    struct dc_sink *sink = impl_from_dc_sink( iface );
+    LONG i;
+
+    if (sink->cancel)
+    {
+        dc_cancel_indicate( sink->cancel );
+        return S_OK;
+    }
+    for (i = 0; i < count; i++)
+    {
+        struct dc_event ev = { GetTickCount(), -1, FALSE, FALSE, -1 };
+        WCHAR class[64] = L"";
+        VARIANT var;
+
+        VariantInit( &var );
+        if (IWbemClassObject_Get( objects[i], L"EventType", 0, &var, NULL, NULL ) == S_OK &&
+            VariantChangeType( &var, &var, 0, VT_I4 ) == S_OK)
+            ev.type = V_I4( &var );
+        VariantClear( &var );
+        if (IWbemClassObject_Get( objects[i], L"__CLASS", 0, &var, NULL, NULL ) == S_OK && V_VT( &var ) == VT_BSTR)
+        {
+            lstrcpynW( class, V_BSTR( &var ), ARRAY_SIZE(class) );
+            ev.class_ok = !wcscmp( class, L"Win32_SystemConfigurationChangeEvent" );
+        }
+        VariantClear( &var );
+        if (IWbemClassObject_Get( objects[i], L"TIME_CREATED", 0, &var, NULL, NULL ) == S_OK)
+            ev.time_ok = V_VT( &var ) == VT_BSTR && V_BSTR( &var ) && V_BSTR( &var )[0];
+        VariantClear( &var );
+        /* consumers re-read the device list from the event callback */
+        if (sink->device) ev.present = count_devices( sink->services, sink->device );
+
+        EnterCriticalSection( &sink->cs );
+        if (!sink->first)
+        {
+            sink->first = objects[i];
+            IWbemClassObject_AddRef( sink->first );
+            lstrcpyW( sink->first_class, class );
+        }
+        if (sink->cancelled) sink->after_cancel++;
+        if (sink->count < MAX_DC_EVENTS) sink->events[sink->count++] = ev;
+        LeaveCriticalSection( &sink->cs );
+        InterlockedIncrement( &sink->objects );
+        trace( "%p event %lu: type %ld, class %s, present %ld\n", sink, ev.tick, ev.type, wine_dbgstr_w(class),
+               ev.present );
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI dc_sink_SetStatus( IWbemObjectSink *iface, LONG flags, HRESULT hresult, BSTR str_param,
+                                         IWbemClassObject *obj_param )
+{
+    struct dc_sink *sink = impl_from_dc_sink( iface );
+
+    trace( "%p SetStatus: %#lx, %#lx\n", sink, flags, hresult );
+    EnterCriticalSection( &sink->cs );
+    sink->status_flags = flags;
+    sink->status_hr = hresult;
+    LeaveCriticalSection( &sink->cs );
+    InterlockedIncrement( &sink->status_calls );
+    return S_OK;
+}
+
+static IWbemObjectSinkVtbl dc_sink_vtbl =
+{
+    dc_sink_QueryInterface,
+    dc_sink_AddRef,
+    dc_sink_Release,
+    dc_sink_Indicate,
+    dc_sink_SetStatus
+};
+
+static void dc_sink_init( struct dc_sink *sink, IWbemServices *services, const WCHAR *device )
+{
+    memset( sink, 0, sizeof(*sink) );
+    sink->IWbemObjectSink_iface.lpVtbl = &dc_sink_vtbl;
+    sink->services = services;
+    sink->device = device;
+    InitializeCriticalSection( &sink->cs );
+}
+
+static void dc_sink_cleanup( struct dc_sink *sink )
+{
+    if (sink->first) IWbemClassObject_Release( sink->first );
+    DeleteCriticalSection( &sink->cs );
+}
+
+/* the sink is called on this (single threaded) apartment on Windows */
+static void pump_messages( DWORD timeout, LONG *until )
+{
+    DWORD start = GetTickCount();
+    MSG msg;
+
+    while (!(until && *until) && GetTickCount() - start < timeout)
+    {
+        MsgWaitForMultipleObjects( 0, NULL, FALSE, 50, QS_ALLINPUT );
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
+        {
+            TranslateMessage( &msg );
+            DispatchMessageW( &msg );
+        }
+    }
+}
+
+static HRESULT subscribe( IWbemServices *services, const WCHAR *str, struct dc_sink *sink )
+{
+    BSTR wql = SysAllocString( L"wql" ), query = SysAllocString( str );
+    HRESULT hr;
+
+    hr = IWbemServices_ExecNotificationQueryAsync( services, wql, query, 0, NULL, &sink->IWbemObjectSink_iface );
+    SysFreeString( wql );
+    SysFreeString( query );
+    return hr;
+}
+
+static void cancel_subscription( IWbemServices *services, struct dc_sink *sink, const WCHAR *str )
+{
+    HRESULT hr;
+
+    EnterCriticalSection( &sink->cs );
+    sink->cancelled = TRUE;
+    LeaveCriticalSection( &sink->cs );
+    hr = IWbemServices_CancelAsyncCall( services, &sink->IWbemObjectSink_iface );
+    ok( hr == S_OK, "%s: CancelAsyncCall got %#lx\n", wine_dbgstr_w(str), hr );
+    pump_messages( 3000, &sink->status_calls );
+    ok( sink->status_calls == 1, "%s: got %ld SetStatus calls\n", wine_dbgstr_w(str), sink->status_calls );
+    ok( sink->status_flags == WBEM_STATUS_COMPLETE, "%s: got status flags %#lx\n", wine_dbgstr_w(str),
+        sink->status_flags );
+    ok( sink->status_hr == WBEM_E_CALL_CANCELLED, "%s: got status %#lx\n", wine_dbgstr_w(str), sink->status_hr );
+}
+
+/* multithreaded apartment, the sink is called on another thread like in .NET */
+static DWORD CALLBACK dc_cancel_thread( void *arg )
+{
+    struct dc_cancel *t = arg;
+    BSTR path = SysAllocString( L"ROOT\\CIMV2" );
+    IWbemLocator *locator;
+    DWORD start, ret;
+    HRESULT hr;
+
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    hr = CoCreateInstance( &CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, &IID_IWbemLocator, (void **)&locator );
+    if (hr == S_OK)
+    {
+        hr = IWbemLocator_ConnectServer( locator, path, NULL, NULL, NULL, 0, NULL, NULL, &t->services );
+        IWbemLocator_Release( locator );
+    }
+    SysFreeString( path );
+    if (hr == S_OK)
+    {
+        CoSetProxyBlanket( (IUnknown *)t->services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL,
+                           RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE );
+        hr = subscribe( t->services, L"SELECT * FROM Win32_DeviceChangeEvent", &t->sink );
+        if (hr != S_OK) IWbemServices_Release( t->services );
+    }
+    t->subscribe_hr = hr;
+    SetEvent( t->subscribed );
+    if (hr != S_OK) goto done;
+
+    if (t->from_indicate) ret = WaitForSingleObject( t->done, 45000 );
+    else if (!(ret = WaitForSingleObject( t->in_indicate, 45000 )))
+    {
+        start = GetTickCount();
+        t->cancel_hr = IWbemServices_CancelAsyncCall( t->services, &t->sink.IWbemObjectSink_iface );
+        t->cancel_ms = GetTickCount() - start;
+        t->objects_at_cancel = t->sink.objects;
+        SetEvent( t->release );
+        SetEvent( t->done );
+    }
+    if (ret)
+    {
+        /* CancelAsyncCall is stuck in Indicate: leak the services */
+        if (t->sink.objects) goto done;
+        IWbemServices_CancelAsyncCall( t->services, &t->sink.IWbemObjectSink_iface );
+    }
+    start = GetTickCount();
+    while (!t->sink.status_calls && GetTickCount() - start < 3000) Sleep( 50 );
+    IWbemServices_Release( t->services );
+done:
+    CoUninitialize();
+    return 0;
+}
+
+static void dc_cancel_start( struct dc_cancel *t, BOOL from_indicate )
+{
+    dc_sink_init( &t->sink, NULL, NULL );
+    t->sink.cancel = t;
+    t->from_indicate = from_indicate;
+    t->subscribed = CreateEventW( NULL, TRUE, FALSE, NULL );
+    t->in_indicate = CreateEventW( NULL, TRUE, FALSE, NULL );
+    t->release = CreateEventW( NULL, TRUE, FALSE, NULL );
+    t->done = CreateEventW( NULL, TRUE, FALSE, NULL );
+    t->subscribe_hr = t->cancel_hr = E_FAIL;
+    t->thread = CreateThread( NULL, 0, dc_cancel_thread, t, 0, NULL );
+    WaitForSingleObject( t->subscribed, 30000 );
+}
+
+static void dc_cancel_check( struct dc_cancel *t )
+{
+    const char *how = t->from_indicate ? "from Indicate" : "while Indicate is busy";
+    DWORD ret;
+
+    ret = WaitForSingleObject( t->thread, 30000 );
+    ok( !ret, "%s: thread didn't finish\n", how );
+    ok( t->subscribe_hr == S_OK, "%s: subscription got %#lx\n", how, t->subscribe_hr );
+    if (ret || t->subscribe_hr != S_OK) return;  /* leak, the sink may still be in use */
+
+    ok( t->sink.objects > 0, "%s: got no event\n", how );
+    if (t->sink.objects)
+    {
+        ret = WaitForSingleObject( t->done, 0 );
+        ok( !ret, "%s: CancelAsyncCall didn't return\n", how );
+        if (ret) return;  /* leak, the sink is still in use */
+        ok( t->cancel_hr == S_OK, "%s: CancelAsyncCall got %#lx\n", how, t->cancel_hr );
+        ok( t->cancel_ms < 1000, "%s: CancelAsyncCall took %lu ms\n", how, t->cancel_ms );
+    }
+    ok( t->sink.status_calls == 1, "%s: got %ld SetStatus calls\n", how, t->sink.status_calls );
+    ok( t->sink.status_hr == WBEM_E_CALL_CANCELLED, "%s: got status %#lx\n", how, t->sink.status_hr );
+    trace( "%s: CancelAsyncCall %lu ms, %ld/%ld Indicate calls at cancel/end, %ld SetStatus while busy, %ld sink refs\n",
+           how, t->cancel_ms, t->objects_at_cancel, t->sink.objects, t->status_while_busy, t->sink.refs );
+
+    CloseHandle( t->thread );
+    CloseHandle( t->subscribed );
+    CloseHandle( t->in_indicate );
+    CloseHandle( t->release );
+    CloseHandle( t->done );
+    dc_sink_cleanup( &t->sink );
+}
+
+static void test_device_change_event_class( IWbemServices *services )
+{
+    static const WCHAR *queries[] =
+    {
+        L"SELECT * FROM Win32_DeviceChangeEvent",
+        L"SELECT * FROM Win32_SystemConfigurationChangeEvent",
+    };
+    BSTR wql = SysAllocString( L"wql" ), query;
+    IEnumWbemClassObject *result;
+    IWbemClassObject *obj;
+    unsigned int i;
+    ULONG count;
+    HRESULT hr;
+
+    /* event classes have no instances */
+    for (i = 0; i < ARRAY_SIZE(queries); i++)
+    {
+        query = SysAllocString( queries[i] );
+        hr = IWbemServices_ExecQuery( services, wql, query, WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &result );
+        ok( hr == S_OK, "%s: got %#lx\n", wine_dbgstr_w(queries[i]), hr );
+        SysFreeString( query );
+        if (hr != S_OK) continue;
+
+        count = 0xdeadbeef;
+        obj = NULL;
+        hr = IEnumWbemClassObject_Next( result, 10000, 1, &obj, &count );
+        ok( hr == WBEM_S_FALSE, "%s: Next got %#lx\n", wine_dbgstr_w(queries[i]), hr );
+        ok( !count, "%s: got %lu instances\n", wine_dbgstr_w(queries[i]), count );
+        if (count && obj) IWbemClassObject_Release( obj );
+        IEnumWbemClassObject_Release( result );
+    }
+    SysFreeString( wql );
+}
+
+static void test_device_change_event_subscription( IWbemServices *services )
+{
+    static const WCHAR *queries[] =
+    {
+        L"SELECT * FROM Win32_DeviceChangeEvent",
+        L"SELECT * FROM Win32_DeviceChangeEvent WHERE EventType = 2",
+    };
+    struct dc_sink sink;
+    unsigned int i;
+    HRESULT hr;
+
+    for (i = 0; i < ARRAY_SIZE(queries); i++)
+    {
+        dc_sink_init( &sink, services, NULL );
+        hr = subscribe( services, queries[i], &sink );
+        ok( hr == S_OK, "%s: got %#lx\n", wine_dbgstr_w(queries[i]), hr );
+        if (hr != S_OK)
+        {
+            dc_sink_cleanup( &sink );
+            continue;
+        }
+
+        /* the subscription stays alive, and devices that are already present are not reported */
+        pump_messages( 1500, NULL );
+        ok( !sink.status_calls, "%s: subscription completed, status %#lx\n", wine_dbgstr_w(queries[i]),
+            sink.status_hr );
+        ok( !sink.objects, "%s: got %ld events without a device change\n", wine_dbgstr_w(queries[i]), sink.objects );
+
+        cancel_subscription( services, &sink, queries[i] );
+        trace( "%s: %ld sink refs after cancel\n", wine_dbgstr_w(queries[i]), sink.refs );
+        dc_sink_cleanup( &sink );
+    }
+}
+
+struct dc_run
+{
+    LONG type;
+    LONG events;
+    LONG present;  /* at the last event of the run */
+};
+
+/* consecutive events of the same type (2 or 3); EventType 1 does not split a run */
+static unsigned int dc_runs( const struct dc_sink *sink, struct dc_run *runs, unsigned int max )
+{
+    unsigned int n = 0;
+    LONG i;
+
+    for (i = 0; i < sink->count; i++)
+    {
+        const struct dc_event *ev = &sink->events[i];
+
+        if (ev->type != 2 && ev->type != 3) continue;
+        if (!n || runs[n - 1].type != ev->type)
+        {
+            if (n == max) break;
+            runs[n].type = ev->type;
+            runs[n].events = 0;
+            n++;
+        }
+        runs[n - 1].events++;
+        runs[n - 1].present = ev->present;
+    }
+    return n;
+}
+
+static void test_device_change_event_interactive( IWbemServices *services, IWbemLocator *locator )
+{
+    static const WCHAR all[] = L"SELECT * FROM Win32_DeviceChangeEvent";
+    static const WCHAR arrivals[] = L"SELECT * FROM Win32_DeviceChangeEvent WHERE EventType = 2";
+    static struct dc_cancel cancels[2];
+    const unsigned int cycles = 3;
+    BSTR path = SysAllocString( L"ROOT\\CIMV2" );
+    struct dc_sink sink, sink2;
+    IWbemServices *services2;
+    struct dc_run runs[16];
+    unsigned int n, i, removals = 0, arrival_runs = 0;
+    LONG bad_class = 0, bad_time = 0, bad_type = 0, bad_type2 = 0, last, objects;
+    WCHAR device[64] = L"";
+    char buf[64];
+    DWORD start;
+    HRESULT hr;
+
+    if (!winetest_interactive)
+    {
+        skip( "Win32_DeviceChangeEvent with a real device is interactive only\n" );
+        return;
+    }
+    if (GetEnvironmentVariableA( "WBEMPROX_TEST_DEVICE", buf, sizeof(buf) ))
+    {
+        MultiByteToWideChar( CP_ACP, 0, buf, -1, device, ARRAY_SIZE(device) );
+        CharUpperW( device );
+    }
+
+    hr = IWbemLocator_ConnectServer( locator, path, NULL, NULL, NULL, 0, NULL, NULL, &services2 );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    SysFreeString( path );
+    if (hr != S_OK) return;
+    CoSetProxyBlanket( (IUnknown *)services2, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL,
+                       RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE );
+
+    dc_sink_init( &sink, services, device[0] ? device : NULL );
+    dc_sink_init( &sink2, services2, NULL );
+    hr = subscribe( services, all, &sink );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    hr = subscribe( services2, arrivals, &sink2 );
+    ok( hr == S_OK, "got %#lx\n", hr );
+
+    trace( "unplug and replug a USB device %u times (device %s), then once more\n", cycles, wine_dbgstr_w(device) );
+    start = GetTickCount();
+    for (;;)
+    {
+        pump_messages( 500, NULL );
+        EnterCriticalSection( &sink.cs );
+        n = dc_runs( &sink, runs, ARRAY_SIZE(runs) );
+        last = sink.count ? sink.events[sink.count - 1].tick : 0;
+        LeaveCriticalSection( &sink.cs );
+        for (i = removals = arrival_runs = 0; i < n; i++)
+        {
+            if (runs[i].type == 3) removals++;
+            else arrival_runs++;
+        }
+        /* wait for the last arrival burst to settle */
+        if (removals >= cycles && arrival_runs >= cycles && GetTickCount() - last > 2000) break;
+        if (GetTickCount() - start > cycles * 60000) break;
+    }
+
+    ok( !sink.status_calls, "subscription completed, status %#lx\n", sink.status_hr );
+    ok( !sink2.status_calls, "filtered subscription completed, status %#lx\n", sink2.status_hr );
+    ok( removals == cycles, "got %u removal bursts, expected %u\n", removals, cycles );
+    ok( arrival_runs == cycles, "got %u arrival bursts, expected %u\n", arrival_runs, cycles );
+    ok( n && runs[0].type == 3, "first burst has type %ld\n", n ? runs[0].type : 0 );
+    for (i = 0; i < n; i++)
+    {
+        trace( "burst %u: type %ld, %ld events, present %ld\n", i, runs[i].type, runs[i].events, runs[i].present );
+        if (!device[0]) continue;
+        if (runs[i].type == 3)
+            ok( !runs[i].present, "burst %u: device still present after removal (%ld)\n", i, runs[i].present );
+        else
+            ok( runs[i].present > 0, "burst %u: device not present after arrival (%ld)\n", i, runs[i].present );
+    }
+    for (i = 0; i < sink.count; i++)
+    {
+        if (!sink.events[i].class_ok) bad_class++;
+        if (!sink.events[i].time_ok) bad_time++;
+        if (sink.events[i].type < 1 || sink.events[i].type > 3) bad_type++;
+    }
+    ok( !bad_class, "%ld of %ld events with an unexpected class, first %s\n", bad_class, sink.count,
+        wine_dbgstr_w(sink.first_class) );
+    ok( !bad_time, "%ld of %ld events without TIME_CREATED\n", bad_time, sink.count );
+    ok( !bad_type, "%ld of %ld events with an unexpected EventType\n", bad_type, sink.count );
+    for (i = 0; i < sink2.count; i++)
+        if (sink2.events[i].type != 2) bad_type2++;
+    ok( !bad_type2, "filtered: %ld of %ld events with EventType other than 2\n", bad_type2, sink2.count );
+    ok( sink2.count >= arrival_runs && arrival_runs, "filtered: got %ld events for %u arrival bursts\n",
+        sink2.count, arrival_runs );
+    if (sink.first)
+    {
+        check_property( sink.first, L"EventType", VT_I4, CIM_UINT16 );
+        check_property( sink.first, L"TIME_CREATED", VT_BSTR, CIM_UINT64 );
+        check_property_nullable( sink.first, L"SECURITY_DESCRIPTOR", VT_UI1 | VT_ARRAY, CIM_UINT8 | CIM_FLAG_ARRAY );
+    }
+
+    /* nothing is delivered after the subscription is cancelled */
+    cancel_subscription( services, &sink, all );
+    cancel_subscription( services2, &sink2, arrivals );
+    objects = sink.objects;
+    /* and cancelling doesn't wait for the sink */
+    dc_cancel_start( &cancels[0], TRUE );
+    dc_cancel_start( &cancels[1], FALSE );
+    trace( "replug the device once more\n" );
+    pump_messages( 30000, NULL );
+    ok( !sink.after_cancel && !sink2.after_cancel, "got %ld/%ld events after cancel\n", sink.after_cancel,
+        sink2.after_cancel );
+    ok( sink.objects == objects, "got %ld events after cancel\n", sink.objects - objects );
+    dc_cancel_check( &cancels[0] );
+    dc_cancel_check( &cancels[1] );
+
+    dc_sink_cleanup( &sink );
+    dc_sink_cleanup( &sink2 );
+    IWbemServices_Release( services2 );
+}
+
 static void test_query_async( IWbemServices *services )
 {
     BSTR wql = SysAllocString( L"wql" ), query = SysAllocString( L"SELECT * FROM Win32_Process" );
@@ -2844,10 +3423,13 @@ START_TEST(query)
                             RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE );
     ok( hr == S_OK, "failed to set proxy blanket %#lx\n", hr );
 
+    test_device_change_event_interactive( services, locator );
     test_GetNames( services );
     test_IEnumWbemClassObject_Next( services );
     test_associators( services );
     test_notification_query_async( services );
+    test_device_change_event_class( services );
+    test_device_change_event_subscription( services );
     test_query_async( services );
     test_query_semisync( services );
     test_select( services );

@@ -24,6 +24,7 @@
 #include "winbase.h"
 #include "objbase.h"
 #include "wbemcli.h"
+#include "cfgmgr32.h"
 
 #include "wine/debug.h"
 #include "wbemprox_private.h"
@@ -154,6 +155,7 @@ struct async_header
     void (*proc)( struct async_header * );
     HANDLE cancel;
     HANDLE wait;
+    BOOL detached; /* cancelling doesn't wait, the async thread frees it */
 };
 
 struct async_query
@@ -175,7 +177,7 @@ static BOOL init_async( struct async_header *async, IWbemObjectSink *sink,
                         void (*proc)(struct async_header *) )
 {
     if (!(async->wait = CreateEventW( NULL, FALSE, FALSE, NULL ))) return FALSE;
-    if (!(async->cancel = CreateEventW( NULL, FALSE, FALSE, NULL )))
+    if (!(async->cancel = CreateEventW( NULL, TRUE, FALSE, NULL )))
     {
         CloseHandle( async->wait );
         return FALSE;
@@ -194,8 +196,19 @@ static DWORD CALLBACK async_proc( LPVOID param )
     async->proc( async );
 
     WaitForSingleObject( async->cancel, INFINITE );
-    SetEvent( wait );
+    if (async->detached) free_async( async );
+    else SetEvent( wait );
     return ERROR_SUCCESS;
+}
+
+static void cancel_async( struct async_header *async )
+{
+    BOOL detached = async->detached;
+
+    SetEvent( async->cancel );
+    if (detached) return;
+    WaitForSingleObject( async->wait, INFINITE );
+    free_async( async );
 }
 
 static HRESULT queue_async( struct async_header *async )
@@ -236,14 +249,7 @@ static ULONG WINAPI wbem_services_Release(
     {
         TRACE("destroying %p\n", ws);
 
-        EnterCriticalSection( &ws->cs );
-        if (ws->async) SetEvent( ws->async->cancel );
-        LeaveCriticalSection( &ws->cs );
-        if (ws->async)
-        {
-            WaitForSingleObject( ws->async->wait, INFINITE );
-            free_async( ws->async );
-        }
+        if (ws->async) cancel_async( ws->async );
         ws->cs.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection( &ws->cs );
         if (ws->context)
@@ -324,12 +330,10 @@ static HRESULT WINAPI wbem_services_CancelAsyncCall(
         return WBEM_E_INVALID_PARAMETER;
     }
     services->async = NULL;
-    SetEvent( async->cancel );
 
     LeaveCriticalSection( &services->cs );
 
-    WaitForSingleObject( async->wait, INFINITE );
-    free_async( async );
+    cancel_async( async );
     return S_OK;
 }
 
@@ -806,6 +810,193 @@ done:
     return hr;
 }
 
+struct device_change
+{
+    struct list entry;
+    UINT16 type;
+    UINT64 time;
+};
+
+struct async_device_change
+{
+    struct async_header hdr;
+    enum wbm_namespace ns;
+    WCHAR *str;
+    struct list entry;
+    struct list events;
+    HANDLE ready;
+};
+
+static struct list device_change_list = LIST_INIT( device_change_list );
+static CRITICAL_SECTION device_change_cs;
+static CRITICAL_SECTION_DEBUG device_change_cs_debug =
+{
+    0, 0, &device_change_cs,
+    { &device_change_cs_debug.ProcessLocksList, &device_change_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": device_change_cs") }
+};
+static CRITICAL_SECTION device_change_cs = { &device_change_cs_debug, -1, 0, 0, 0, 0 };
+
+/* called on the plugplay notification thread, only queue the event */
+static DWORD CALLBACK device_change_callback( HCMNOTIFICATION notify, void *context, CM_NOTIFY_ACTION action,
+                                              CM_NOTIFY_EVENT_DATA *data, DWORD size )
+{
+    struct async_device_change *async;
+    struct device_change *event;
+    FILETIME ft;
+    UINT16 type;
+
+    switch (action)
+    {
+    case CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL: type = 2; break;
+    case CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL: type = 3; break;
+    default: return ERROR_SUCCESS;
+    }
+    GetSystemTimeAsFileTime( &ft );
+
+    EnterCriticalSection( &device_change_cs );
+    LIST_FOR_EACH_ENTRY( async, &device_change_list, struct async_device_change, entry )
+    {
+        if (!(event = malloc( sizeof(*event) ))) break;
+        event->type = type;
+        event->time = ((UINT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        list_add_tail( &async->events, &event->entry );
+        SetEvent( async->ready );
+    }
+    LeaveCriticalSection( &device_change_cs );
+    return ERROR_SUCCESS;
+}
+
+/* CM_Unregister_Notification doesn't wait for callbacks in progress, so keep one registration
+ * for the lifetime of the process */
+static BOOL WINAPI register_device_change( INIT_ONCE *once, void *param, void **context )
+{
+    CM_NOTIFY_FILTER filter = { sizeof(filter) };
+    HCMNOTIFICATION notify;
+    CONFIGRET ret;
+
+    filter.Flags = CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES;
+    filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+    if ((ret = CM_Register_Notification( &filter, NULL, device_change_callback, &notify )))
+    {
+        ERR( "failed to register for device notifications, error %lu\n", ret );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void indicate_device_change( struct async_device_change *async, const struct device_change *event )
+{
+    IEnumWbemClassObject *result;
+    IWbemClassObject *obj;
+    struct query *query;
+    ULONG count = 0;
+    HRESULT hr;
+
+    if (!(query = create_query( async->ns ))) return;
+    if ((hr = parse_query( async->ns, async->str, &query->view, &query->mem )) == S_OK &&
+        (hr = set_device_change_event( query->view, event->type, event->time )) == S_OK &&
+        (hr = execute_view( query->view )) == S_OK &&
+        (hr = EnumWbemClassObject_create( query, (void **)&result )) == S_OK)
+    {
+        IEnumWbemClassObject_Next( result, WBEM_INFINITE, 1, &obj, &count );
+        if (count)
+        {
+            IWbemObjectSink_Indicate( async->hdr.sink, 1, &obj );
+            IWbemClassObject_Release( obj );
+        }
+        IEnumWbemClassObject_Release( result );
+    }
+    if (hr != S_OK) ERR( "failed to create event, hr %#lx\n", hr );
+    release_query( query );
+}
+
+static void async_device_change( struct async_header *hdr )
+{
+    struct async_device_change *async = (struct async_device_change *)hdr;
+    HANDLE handles[2] = { hdr->cancel, async->ready };
+    struct device_change *event, *next;
+    struct list events = LIST_INIT( events );
+
+    while (WaitForMultipleObjects( 2, handles, FALSE, INFINITE ) == WAIT_OBJECT_0 + 1)
+    {
+        EnterCriticalSection( &device_change_cs );
+        list_move_tail( &events, &async->events );
+        LeaveCriticalSection( &device_change_cs );
+
+        LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_change, entry )
+        {
+            if (WaitForSingleObject( hdr->cancel, 0 ) == WAIT_OBJECT_0) break;
+            list_remove( &event->entry );
+            indicate_device_change( async, event );
+            free( event );
+        }
+    }
+
+    EnterCriticalSection( &device_change_cs );
+    list_remove( &async->entry );
+    list_move_tail( &events, &async->events );
+    LeaveCriticalSection( &device_change_cs );
+    LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_change, entry ) free( event );
+
+    IWbemObjectSink_SetStatus( hdr->sink, WBEM_STATUS_COMPLETE, WBEM_E_CALL_CANCELLED, NULL, NULL );
+    CloseHandle( async->ready );
+    free( async->str );
+}
+
+static BOOL is_device_change_query( enum wbm_namespace ns, const WCHAR *str )
+{
+    struct query *query;
+    BOOL ret = FALSE;
+
+    if (!str || !(query = create_query( ns ))) return FALSE;
+    if (parse_query( ns, str, &query->view, &query->mem ) == S_OK) ret = is_device_change_event( query->view );
+    release_query( query );
+    return ret;
+}
+
+static HRESULT exec_device_change_query( struct wbem_services *services, const WCHAR *str, IWbemObjectSink *sink )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    struct async_device_change *async;
+    HRESULT hr;
+
+    if (!InitOnceExecuteOnce( &once, register_device_change, NULL, NULL )) return WBEM_E_FAILED;
+
+    if (!(async = calloc( 1, sizeof(*async) ))) return E_OUTOFMEMORY;
+    async->ns = services->ns;
+    list_init( &async->events );
+    if (!init_async( &async->hdr, sink, async_device_change ))
+    {
+        free( async );
+        return E_OUTOFMEMORY;
+    }
+    /* like on Windows, cancelling doesn't wait for a sink call in progress, which may be the caller */
+    async->hdr.detached = TRUE;
+    if (!(async->str = wcsdup( str )) || !(async->ready = CreateEventW( NULL, FALSE, FALSE, NULL )))
+    {
+        free( async->str );
+        free_async( &async->hdr );
+        return E_OUTOFMEMORY;
+    }
+
+    EnterCriticalSection( &device_change_cs );
+    list_add_tail( &device_change_list, &async->entry );
+    LeaveCriticalSection( &device_change_cs );
+
+    if ((hr = queue_async( &async->hdr )) == S_OK) services->async = &async->hdr;
+    else
+    {
+        EnterCriticalSection( &device_change_cs );
+        list_remove( &async->entry );
+        LeaveCriticalSection( &device_change_cs );
+        CloseHandle( async->ready );
+        free( async->str );
+        free_async( &async->hdr );
+    }
+    return hr;
+}
+
 static HRESULT WINAPI wbem_services_ExecNotificationQuery(
     IWbemServices *iface,
     const BSTR strQueryLanguage,
@@ -846,6 +1037,11 @@ static HRESULT WINAPI wbem_services_ExecNotificationQueryAsync(
     {
         FIXME("handle more than one pending async\n");
         hr = WBEM_E_FAILED;
+        goto done;
+    }
+    if (is_device_change_query( services->ns, strQuery ))
+    {
+        hr = exec_device_change_query( services, strQuery, sink );
         goto done;
     }
     if (!(query = calloc( 1, sizeof(*query) ))) goto done;

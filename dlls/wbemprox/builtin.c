@@ -139,6 +139,12 @@ static const struct column col_desktopmonitor[] =
     { L"PixelsPerXLogicalInch", CIM_UINT32 },
     { L"Status",                CIM_STRING },
 };
+static const struct column col_devicechangeevent[] =
+{
+    { L"EventType",           CIM_UINT16 },
+    { L"SECURITY_DESCRIPTOR", CIM_UINT8|CIM_FLAG_ARRAY },
+    { L"TIME_CREATED",        CIM_UINT64 },
+};
 static const struct column col_directory[] =
 {
     { L"AccessMask", CIM_UINT32 },
@@ -721,6 +727,12 @@ struct record_desktopmonitor
     const WCHAR *name;
     UINT32       pixelsperxlogicalinch;
     const WCHAR *status;
+};
+struct record_devicechangeevent
+{
+    UINT16              eventtype;
+    const struct array *security_descriptor;
+    UINT64              time_created;
 };
 struct record_directory
 {
@@ -2493,6 +2505,40 @@ static enum fill_status fill_desktopmonitor( struct table *table, const struct e
     TRACE("created %u rows\n", row);
     table->num_rows = row;
     return status;
+}
+
+BOOL is_device_change_event( const struct view *view )
+{
+    const WCHAR *name;
+
+    if (view->type != VIEW_TYPE_SELECT || !view->table_count) return FALSE;
+    name = view->table[0]->name;
+    return !wcsicmp( name, L"Win32_DeviceChangeEvent" ) || !wcsicmp( name, L"Win32_SystemConfigurationChangeEvent" );
+}
+
+/* replace the table of an event query with a single event instance */
+HRESULT set_device_change_event( struct view *view, UINT16 type, UINT64 time )
+{
+    struct record_devicechangeevent *rec;
+    struct table *table;
+
+    if (!is_device_change_event( view )) return WBEM_E_INVALID_CLASS;
+    if (!(table = create_table( view->ns, L"Win32_SystemConfigurationChangeEvent" ))) return E_OUTOFMEMORY;
+    if (!resize_table( table, 1, sizeof(*rec) ))
+    {
+        release_table( table );
+        return E_OUTOFMEMORY;
+    }
+
+    rec = (struct record_devicechangeevent *)table->data;
+    rec->eventtype           = type;
+    rec->security_descriptor = NULL;
+    rec->time_created        = time;
+    table->num_rows = 1;
+
+    release_table( view->table[0] );
+    view->table[0] = table;
+    return S_OK;
 }
 
 static enum fill_status fill_directory( struct table *table, const struct expr *cond )
@@ -5004,6 +5050,7 @@ static struct table cimv2_builtin_classes[] =
     { L"Win32_ComputerSystem", C(col_compsys), 0, 0, NULL, fill_compsys },
     { L"Win32_ComputerSystemProduct", C(col_compsysproduct), 0, 0, NULL, fill_compsysproduct },
     { L"Win32_DesktopMonitor", C(col_desktopmonitor), 0, 0, NULL, fill_desktopmonitor },
+    { L"Win32_DeviceChangeEvent", C(col_devicechangeevent) },
     { L"Win32_Directory", C(col_directory), 0, 0, NULL, fill_directory },
     { L"Win32_DiskDrive", C(col_diskdrive), 0, 0, NULL, fill_diskdrive },
     { L"Win32_DiskDriveToDiskPartition", C(col_diskdrivetodiskpartition), 0, 0, NULL, fill_diskdrivetodiskpartition },
@@ -5028,6 +5075,7 @@ static struct table cimv2_builtin_classes[] =
     { L"Win32_SID", C(col_sid), 0, 0, NULL, fill_sid },
     { L"Win32_Service", C(col_service), 0, 0, NULL, fill_service },
     { L"Win32_SoundDevice", C(col_sounddevice), 0, 0, NULL, fill_sounddevice },
+    { L"Win32_SystemConfigurationChangeEvent", C(col_devicechangeevent) },
     { L"Win32_SystemEnclosure", C(col_systemenclosure), 0, 0, NULL, fill_systemenclosure },
     { L"Win32_VideoController", C(col_videocontroller), 0, 0, NULL, fill_videocontroller },
     { L"Win32_Volume", C(col_volume), 0, 0, NULL, fill_volume },

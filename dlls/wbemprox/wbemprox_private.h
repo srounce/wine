@@ -241,6 +241,8 @@ void destroy_array( struct array *, CIMTYPE );
 BOOL is_result_prop( const struct view *, const WCHAR * );
 HRESULT get_properties( const struct view *, UINT, LONG, SAFEARRAY ** );
 HRESULT get_object( enum wbm_namespace, const WCHAR *, IWbemClassObject ** );
+BOOL is_device_change_event( const struct view * );
+HRESULT set_device_change_event( struct view *, UINT16, UINT64 );
 BSTR get_method_name( enum wbm_namespace, const WCHAR *, UINT );
 WCHAR *get_first_key_property( enum wbm_namespace, const WCHAR * );
 void set_variant( VARTYPE, LONGLONG, void *, VARIANT * );
