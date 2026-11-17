@@ -26,7 +26,10 @@ jobs:
           sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get build-dep -y wine
+          # g++-mingw-w64 is needed for the C++ PE modules (icu, dmsynth, ...);
+          # without it configure silently skips them.
           sudo apt-get install -y flex bison gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+            g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             libusb-1.0-0-dev libudev-dev
 
       - name: Configure
