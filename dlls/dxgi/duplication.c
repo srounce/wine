@@ -208,6 +208,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_duplication_AcquireNextFrame(IDXGIO
     params.width = dupl->desc.ModeDesc.Width;
     params.height = dupl->desc.ModeDesc.Height;
     params.pitch = dupl->pitch;
+    switch (dupl->desc.Rotation)
+    {
+        case DXGI_MODE_ROTATION_ROTATE90:  params.rotation = DUPL_ROTATION_90; break;
+        case DXGI_MODE_ROTATION_ROTATE180: params.rotation = DUPL_ROTATION_180; break;
+        case DXGI_MODE_ROTATION_ROTATE270: params.rotation = DUPL_ROTATION_270; break;
+        default:                           params.rotation = DUPL_ROTATION_0; break;
+    }
     status = WINE_UNIX_CALL(unix_dupl_acquire, &params);
     if (status && status != STATUS_TIMEOUT)
     {
@@ -365,7 +372,8 @@ HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *dev
     struct wined3d_display_mode mode;
     D3D11_TEXTURE2D_DESC texture_desc;
     char key[CCHDEVICENAME * 3];
-    UINT width, height;
+    UINT width, height, desktop_width, desktop_height;
+    DXGI_MODE_ROTATION dxgi_rotation;
     NTSTATUS status;
     HRESULT hr;
 
@@ -383,10 +391,24 @@ HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *dev
     if (FAILED(hr))
         return hr;
 
-    width = output_desc.desktop_rect.right - output_desc.desktop_rect.left;
-    height = output_desc.desktop_rect.bottom - output_desc.desktop_rect.top;
-    if (!width || !height)
+    desktop_width = output_desc.desktop_rect.right - output_desc.desktop_rect.left;
+    desktop_height = output_desc.desktop_rect.bottom - output_desc.desktop_rect.top;
+    if (!desktop_width || !desktop_height)
         return DXGI_ERROR_UNSUPPORTED;
+
+    /* As on Windows, the image of a rotated output is unrotated, so for 90
+     * and 270 degrees it is as wide as the desktop is tall. */
+    dxgi_rotation = dxgi_mode_rotation_from_wined3d(rotation);
+    if (dxgi_rotation == DXGI_MODE_ROTATION_ROTATE90 || dxgi_rotation == DXGI_MODE_ROTATION_ROTATE270)
+    {
+        width = desktop_height;
+        height = desktop_width;
+    }
+    else
+    {
+        width = desktop_width;
+        height = desktop_height;
+    }
 
     if (!(dupl = calloc(1, sizeof(*dupl))))
         return E_OUTOFMEMORY;
@@ -415,8 +437,7 @@ HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *dev
     dupl->desc.ModeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     dupl->desc.ModeDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE;
     dupl->desc.ModeDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
-    /* Frames show the desktop the way the user sees it. */
-    dupl->desc.Rotation = DXGI_MODE_ROTATION_IDENTITY;
+    dupl->desc.Rotation = dxgi_rotation;
     dupl->desc.DesktopImageInSystemMemory = FALSE;
 
     texture_desc.Width = width;
@@ -446,8 +467,8 @@ HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *dev
     WideCharToMultiByte(CP_UTF8, 0, output_desc.device_name, -1, key, sizeof(key), NULL, NULL);
     params.handle = 0;
     params.key = key;
-    params.width = width;
-    params.height = height;
+    params.width = desktop_width;
+    params.height = desktop_height;
     if ((status = WINE_UNIX_CALL(unix_dupl_create, &params)))
     {
         WARN("Failed to start desktop capture for %s, status %#lx.\n", debugstr_a(key), status);
@@ -456,7 +477,8 @@ HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *dev
     }
     dupl->handle = params.handle;
 
-    TRACE("Created output duplication %p for %s, %ux%u.\n", dupl, debugstr_a(key), width, height);
+    TRACE("Created output duplication %p for %s, %ux%u, rotation %u.\n",
+            dupl, debugstr_a(key), width, height, dxgi_rotation);
     *out = &dupl->IDXGIOutputDuplication_iface;
     return S_OK;
 

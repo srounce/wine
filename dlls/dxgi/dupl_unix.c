@@ -855,12 +855,16 @@ static void copy_frame(const struct dupl *dupl, const struct dupl_acquire_params
 {
     UINT32 src_width = dupl->front_width, src_height = dupl->front_height;
     UINT32 dst_width = params->width, dst_height = params->height, x, y;
-    BOOL swap_rb = dupl->front_swap_rb, scale = src_width != dst_width || src_height != dst_height;
+    BOOL transpose = params->rotation == DUPL_ROTATION_90 || params->rotation == DUPL_ROTATION_270;
+    /* Size of the destination as the user sees it, i.e. with the rotation undone. */
+    UINT32 view_width = transpose ? dst_height : dst_width;
+    UINT32 view_height = transpose ? dst_width : dst_height;
+    BOOL swap_rb = dupl->front_swap_rb, scale = src_width != view_width || src_height != view_height;
     const UINT32 *src = (const UINT32 *)dupl->front, *src_row;
     unsigned char *dst = params->buffer;
     UINT32 *dst_row;
 
-    if (!scale)
+    if (!scale && params->rotation == DUPL_ROTATION_0)
     {
         for (y = 0; y < dst_height; ++y)
         {
@@ -877,13 +881,39 @@ static void copy_frame(const struct dupl *dupl, const struct dupl_acquire_params
         return;
     }
 
-    /* Scale with nearest neighbour and convert to BGRA. */
+    if (!scale && params->rotation == DUPL_ROTATION_180)
+    {
+        for (y = 0; y < dst_height; ++y)
+        {
+            dst_row = (UINT32 *)(dst + (size_t)y * params->pitch);
+            src_row = src + (size_t)(src_height - 1 - y) * src_width + src_width - 1;
+            for (x = 0; x < dst_width; ++x)
+                dst_row[x] = convert_pixel(src_row[-(ptrdiff_t)x], swap_rb);
+        }
+        return;
+    }
+
+    /* General case: rotate, scale with nearest neighbour and convert to BGRA.
+     * (vx, vy) is the destination pixel's position on the desktop as the user
+     * sees it, using the same mapping as the DXGI desktop duplication sample. */
     for (y = 0; y < dst_height; ++y)
     {
         dst_row = (UINT32 *)(dst + (size_t)y * params->pitch);
-        src_row = src + (size_t)(y * (UINT64)src_height / dst_height) * src_width;
         for (x = 0; x < dst_width; ++x)
-            dst_row[x] = convert_pixel(src_row[x * (UINT64)src_width / dst_width], swap_rb);
+        {
+            UINT32 vx, vy, sx, sy;
+
+            switch (params->rotation)
+            {
+                case DUPL_ROTATION_90:  vx = view_width - 1 - y; vy = x; break;
+                case DUPL_ROTATION_180: vx = view_width - 1 - x; vy = view_height - 1 - y; break;
+                case DUPL_ROTATION_270: vx = y; vy = view_height - 1 - x; break;
+                default:                vx = x; vy = y; break;
+            }
+            sx = vx * (UINT64)src_width / view_width;
+            sy = vy * (UINT64)src_height / view_height;
+            dst_row[x] = convert_pixel(src[(size_t)sy * src_width + sx], swap_rb);
+        }
     }
 }
 
@@ -996,6 +1026,7 @@ static NTSTATUS wow64_dupl_acquire(void *args)
         UINT32 width;
         UINT32 height;
         UINT32 pitch;
+        UINT32 rotation;
     } const *params32 = args;
     struct dupl_acquire_params params =
     {
@@ -1005,6 +1036,7 @@ static NTSTATUS wow64_dupl_acquire(void *args)
         .width = params32->width,
         .height = params32->height,
         .pitch = params32->pitch,
+        .rotation = params32->rotation,
     };
 
     return dupl_acquire(&params);

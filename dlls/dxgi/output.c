@@ -25,11 +25,6 @@ static inline DXGI_MODE_SCANLINE_ORDER dxgi_mode_scanline_order_from_wined3d(enu
     return (DXGI_MODE_SCANLINE_ORDER)ordering;
 }
 
-static inline DXGI_MODE_ROTATION dxgi_mode_rotation_from_wined3d(enum wined3d_display_rotation rotation)
-{
-    return (DXGI_MODE_ROTATION)rotation;
-}
-
 static void dxgi_mode_from_wined3d(DXGI_MODE_DESC *mode, const struct wined3d_display_mode *wined3d_mode)
 {
     mode->Width = wined3d_mode->width;

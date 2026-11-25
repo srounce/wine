@@ -34,6 +34,17 @@ struct dupl_create_params
     UINT32 height;
 };
 
+/* Captured frames show the desktop the way the user sees it. Windows returns
+ * the image of a rotated output unrotated, and applications rotate it back,
+ * so the copy applies the inverse of the output rotation. */
+enum dupl_rotation
+{
+    DUPL_ROTATION_0,
+    DUPL_ROTATION_90,
+    DUPL_ROTATION_180,
+    DUPL_ROTATION_270,
+};
+
 struct dupl_acquire_params
 {
     UINT64 handle;
@@ -42,6 +53,7 @@ struct dupl_acquire_params
     UINT32 width;       /* destination size; frames are scaled to fit if needed */
     UINT32 height;
     UINT32 pitch;
+    UINT32 rotation;    /* enum dupl_rotation */
 };
 
 struct dupl_destroy_params

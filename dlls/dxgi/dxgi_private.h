@@ -151,6 +151,11 @@ struct dxgi_output
     struct dxgi_adapter *adapter;
 };
 
+static inline DXGI_MODE_ROTATION dxgi_mode_rotation_from_wined3d(enum wined3d_display_rotation rotation)
+{
+    return (DXGI_MODE_ROTATION)rotation;
+}
+
 HRESULT dxgi_output_create(struct dxgi_adapter *adapter, unsigned int output_idx,
         struct dxgi_output **output);
 HRESULT dxgi_output_duplication_create(struct dxgi_output *output, IUnknown *device,
