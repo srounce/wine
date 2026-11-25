@@ -327,6 +327,9 @@
 /* Define to 1 if you have the 'pipe2' function. */
 #undef HAVE_PIPE2
 
+/* Define to 1 if you have the <pipewire/pipewire.h> header file. */
+#undef HAVE_PIPEWIRE_PIPEWIRE_H
+
 /* Define to 1 if you have the 'port_create' function. */
 #undef HAVE_PORT_CREATE
 

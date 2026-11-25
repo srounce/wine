@@ -1,13 +1,18 @@
 MODULE    = dxgi.dll
 IMPORTLIB = dxgi
+UNIXLIB   = dxgi.so
 IMPORTS   = gdi32 dxguid uuid wined3d user32 win32u
 EXTRAINCL = $(VKD3D_PE_CFLAGS)
+UNIX_CFLAGS = $(PIPEWIRE_CFLAGS) $(DBUS_CFLAGS)
+UNIX_LIBS = $(PIPEWIRE_LIBS) $(DBUS_LIBS) $(PTHREAD_LIBS)
 
 VER_PRODUCTVERSION = 6,0,6000,16386
 
 SOURCES = \
 	adapter.c \
 	device.c \
+	dupl_unix.c \
+	duplication.c \
 	dxgi_main.c \
 	factory.c \
 	output.c \

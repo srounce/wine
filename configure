@@ -658,6 +658,8 @@ GSTREAMER_LIBS
 GSTREAMER_CFLAGS
 FFMPEG_LIBS
 FFMPEG_CFLAGS
+PIPEWIRE_LIBS
+PIPEWIRE_CFLAGS
 PULSE_LIBS
 PULSE_CFLAGS
 GETTEXTPO_LIBS
@@ -962,6 +964,7 @@ with_opengl
 with_oss
 with_pcap
 with_pcsclite
+with_pipewire
 with_pthread
 with_pulse
 with_sane
@@ -1941,6 +1944,8 @@ FREETYPE_CFLAGS
 FREETYPE_LIBS
 PULSE_CFLAGS
 PULSE_LIBS
+PIPEWIRE_CFLAGS
+PIPEWIRE_LIBS
 FFMPEG_CFLAGS
 FFMPEG_LIBS
 GSTREAMER_CFLAGS
@@ -2633,6 +2638,7 @@ Optional Packages:
   --without-oss           do not use the OSS sound support
   --without-pcap          do not use the Packet Capture library
   --without-pcsclite      do not use PCSC lite
+  --without-pipewire      do not use PipeWire (desktop duplication)
   --without-pthread       do not use the pthread library
   --without-pulse         do not use PulseAudio sound support
   --without-sane          do not use SANE (scanner support)
@@ -2840,6 +2846,10 @@ Some influential environment variables:
   PULSE_CFLAGS
               C compiler flags for libpulse, overriding pkg-config
   PULSE_LIBS  Linker flags for libpulse, overriding pkg-config
+  PIPEWIRE_CFLAGS
+              C compiler flags for libpipewire-0.3, overriding pkg-config
+  PIPEWIRE_LIBS
+              Linker flags for libpipewire-0.3, overriding pkg-config
   FFMPEG_CFLAGS
               C compiler flags for libavutil libavformat libavcodec,
               overriding pkg-config
@@ -4445,6 +4455,13 @@ fi
 if test ${with_pcsclite+y}
 then :
   withval=$with_pcsclite;
+fi
+
+
+# Check whether --with-pipewire was given.
+if test ${with_pipewire+y}
+then :
+  withval=$with_pipewire;
 fi
 
 
@@ -18259,6 +18276,76 @@ esac
 enable_winepulse_drv=${enable_winepulse_drv:-no}
 fi
 
+if test "x$with_pipewire" != "xno";
+then
+    rm -f conftest.err
+if ${PIPEWIRE_CFLAGS:+false} :
+then :
+  if test ${PKG_CONFIG+y}
+then :
+  PIPEWIRE_CFLAGS=`$PKG_CONFIG --cflags libpipewire-0.3 2>conftest.err`
+fi
+fi
+
+if ${PIPEWIRE_LIBS:+false} :
+then :
+  if test ${PKG_CONFIG+y}
+then :
+  PIPEWIRE_LIBS=`$PKG_CONFIG --libs libpipewire-0.3 2>/dev/null`
+fi
+fi
+
+
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: libpipewire-0.3 cflags: $PIPEWIRE_CFLAGS" >&5
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: libpipewire-0.3 libs: $PIPEWIRE_LIBS" >&5
+if test -s conftest.err; then
+     printf %s "$as_me:${as_lineno-$LINENO}: libpipewire-0.3 errors: " >&5
+     cat conftest.err >&5
+fi
+rm -f conftest.err
+if test -n "$PIPEWIRE_CFLAGS$PIPEWIRE_LIBS"
+then :
+  ac_save_pkg_CPPFLAGS=$CPPFLAGS
+ac_save_pkg_LIBS=$LIBS
+CPPFLAGS="$CPPFLAGS $PIPEWIRE_CFLAGS"
+LIBS="$PIPEWIRE_LIBS $LIBS"
+ac_fn_c_check_func "$LINENO" "pw_stream_connect" "ac_cv_func_pw_stream_connect"
+if test "x$ac_cv_func_pw_stream_connect" = xyes
+then :
+         for ac_header in pipewire/pipewire.h
+do :
+  ac_fn_c_check_header_compile "$LINENO" "pipewire/pipewire.h" "ac_cv_header_pipewire_pipewire_h" "$ac_includes_default"
+if test "x$ac_cv_header_pipewire_pipewire_h" = xyes
+then :
+  printf '%s\n' "#define HAVE_PIPEWIRE_PIPEWIRE_H 1" >>confdefs.h
+
+else case e in #(
+  e) PIPEWIRE_LIBS="" ;;
+esac
+fi
+
+done
+else case e in #(
+  e) PIPEWIRE_LIBS="" ;;
+esac
+fi
+
+CPPFLAGS=$ac_save_pkg_CPPFLAGS
+LIBS=$ac_save_pkg_LIBS
+fi
+
+fi
+if test "x$ac_cv_header_pipewire_pipewire_h" != xyes -o "x$ac_cv_lib_soname_dbus_1" = x
+then :
+  case "x$with_pipewire" in
+  x)   as_fn_append wine_notices "|libpipewire or libdbus ${notice_platform}development files not found, desktop duplication won't be supported." ;;
+  xno) ;;
+  *)   as_fn_error $? "libpipewire or libdbus ${notice_platform}development files not found, desktop duplication won't be supported.
+This is an error since --with-pipewire was requested." "$LINENO" 5 ;;
+esac
+
+fi
+
 if test "x$with_ffmpeg" != "xno";
 then
     rm -f conftest.err
@@ -24306,6 +24393,8 @@ FREETYPE_LIBS = $FREETYPE_LIBS
 GETTEXTPO_LIBS = $GETTEXTPO_LIBS
 PULSE_CFLAGS = $PULSE_CFLAGS
 PULSE_LIBS = $PULSE_LIBS
+PIPEWIRE_CFLAGS = $PIPEWIRE_CFLAGS
+PIPEWIRE_LIBS = $PIPEWIRE_LIBS
 FFMPEG_CFLAGS = $FFMPEG_CFLAGS
 FFMPEG_LIBS = $FFMPEG_LIBS
 GSTREAMER_CFLAGS = $GSTREAMER_CFLAGS
