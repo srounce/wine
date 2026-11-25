@@ -25,11 +25,6 @@ static inline DXGI_MODE_SCANLINE_ORDER dxgi_mode_scanline_order_from_wined3d(enu
     return (DXGI_MODE_SCANLINE_ORDER)ordering;
 }
 
-static inline DXGI_MODE_ROTATION dxgi_mode_rotation_from_wined3d(enum wined3d_display_rotation rotation)
-{
-    return (DXGI_MODE_ROTATION)rotation;
-}
-
 static void dxgi_mode_from_wined3d(DXGI_MODE_DESC *mode, const struct wined3d_display_mode *wined3d_mode)
 {
     mode->Width = wined3d_mode->width;
@@ -542,9 +537,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_GetDisplaySurfaceData1(IDXGIOutput6
 static HRESULT STDMETHODCALLTYPE dxgi_output_DuplicateOutput(IDXGIOutput6 *iface,
         IUnknown *device, IDXGIOutputDuplication **output_duplication)
 {
-    FIXME("iface %p, device %p, output_duplication %p stub!\n", iface, device, output_duplication);
+    struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, device %p, output_duplication %p.\n", iface, device, output_duplication);
+
+    if (!device || !output_duplication)
+        return E_INVALIDARG;
+
+    return dxgi_output_duplication_create(output, device, output_duplication);
 }
 
 /* IDXGIOutput2 methods */
@@ -583,11 +583,24 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_DuplicateOutput1(IDXGIOutput6 *ifac
         IUnknown *device, UINT flags, UINT format_count, const DXGI_FORMAT *formats,
         IDXGIOutputDuplication **output_duplication)
 {
-    FIXME("iface %p, device %p, flags %#x, format_count %u, formats %p, "
-            "output_duplication %p stub!\n", iface, device, flags, format_count,
-            formats, output_duplication);
+    struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
+    unsigned int i;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, device %p, flags %#x, format_count %u, formats %p, output_duplication %p.\n",
+            iface, device, flags, format_count, formats, output_duplication);
+
+    if (!device || !output_duplication || !format_count || !formats)
+        return E_INVALIDARG;
+
+    /* Frames are always delivered as B8G8R8A8_UNORM. */
+    for (i = 0; i < format_count; ++i)
+    {
+        if (formats[i] == DXGI_FORMAT_B8G8R8A8_UNORM)
+            return dxgi_output_duplication_create(output, device, output_duplication);
+    }
+
+    FIXME("None of the %u requested formats is supported.\n", format_count);
+    return DXGI_ERROR_UNSUPPORTED;
 }
 
 /* IDXGIOutput6 methods */

@@ -27,10 +27,11 @@ jobs:
           sudo apt-get update
           sudo apt-get build-dep -y wine
           # g++-mingw-w64 is needed for the C++ PE modules (icu, dmsynth, ...);
-          # without it configure silently skips them.
+          # without it configure silently skips them. build-dep doesn't pull in
+          # libpipewire-0.3-dev, without which dxgi's desktop duplication is a stub.
           sudo apt-get install -y flex bison gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            libusb-1.0-0-dev libudev-dev
+            libusb-1.0-0-dev libudev-dev libpipewire-0.3-dev
 
       - name: Configure
         # A single WoW64 build: 64-bit host libraries serving both 64-bit and

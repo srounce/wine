@@ -52,6 +52,7 @@ AC_ARG_WITH(opengl,    AS_HELP_STRING([--without-opengl],[do not use OpenGL]))
 AC_ARG_WITH(oss,       AS_HELP_STRING([--without-oss],[do not use the OSS sound support]))
 AC_ARG_WITH(pcap,      AS_HELP_STRING([--without-pcap],[do not use the Packet Capture library]))
 AC_ARG_WITH(pcsclite,  AS_HELP_STRING([--without-pcsclite],[do not use PCSC lite]))
+AC_ARG_WITH(pipewire,  AS_HELP_STRING([--without-pipewire],[do not use PipeWire (desktop duplication)]))
 AC_ARG_WITH(pthread,   AS_HELP_STRING([--without-pthread],[do not use the pthread library]))
 AC_ARG_WITH(pulse,     AS_HELP_STRING([--without-pulse],[do not use PulseAudio sound support]))
 AC_ARG_WITH(sane,      AS_HELP_STRING([--without-sane],[do not use SANE (scanner support)]))
@@ -1730,6 +1731,17 @@ fi
 WINE_NOTICE_WITH(pulse, [test -z "$PULSE_LIBS"],
         [libpulse ${notice_platform}development files not found or too old, Pulse won't be supported.],
         [enable_winepulse_drv])
+
+dnl **** Check for PipeWire ****
+if test "x$with_pipewire" != "xno";
+then
+    WINE_PACKAGE_FLAGS(PIPEWIRE,[libpipewire-0.3],,,,
+        [AC_CHECK_FUNC(pw_stream_connect,
+            [AC_CHECK_HEADERS([pipewire/pipewire.h],,[PIPEWIRE_LIBS=""])],
+            [PIPEWIRE_LIBS=""])])
+fi
+WINE_NOTICE_WITH(pipewire, [test "x$ac_cv_header_pipewire_pipewire_h" != xyes -o "x$ac_cv_lib_soname_dbus_1" = x],
+        [libpipewire or libdbus ${notice_platform}development files not found, desktop duplication won't be supported.])
 
 dnl **** Check for FFmpeg ****
 if test "x$with_ffmpeg" != "xno";
