@@ -621,6 +621,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pMapVirtualKeyEx = X11DRV_MapVirtualKeyEx,
     .pToUnicodeEx = X11DRV_ToUnicodeEx,
     .pVkKeyScanEx = X11DRV_VkKeyScanEx,
+    .pForwardInput = X11DRV_ForwardInput,
     .pNotifyIMEStatus = X11DRV_NotifyIMEStatus,
     .pSetIMECompositionRect = X11DRV_SetIMECompositionRect,
     .pDestroyCursorIcon = X11DRV_DestroyCursorIcon,

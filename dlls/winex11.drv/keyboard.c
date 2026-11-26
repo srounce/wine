@@ -39,12 +39,16 @@
 #ifdef SONAME_LIBXKBREGISTRY
 #include <xkbcommon/xkbregistry.h>
 #endif
+#ifdef SONAME_LIBXTST
+#include <X11/extensions/XTest.h>
+#endif
 
 #include <ctype.h>
 #include <stdarg.h>
 #include <string.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
 
 #include "x11drv.h"
 
@@ -2324,6 +2328,207 @@ xkbregistry_init_done:
 #endif
 
     init_keyboard_layouts( display );
+}
+
+
+#ifdef SONAME_LIBXTST
+enum key_route
+{
+    KEY_ROUTE_NONE,   /* the key isn't down through SendInput */
+    KEY_ROUTE_SERVER, /* the key went down through wineserver */
+    KEY_ROUTE_XTEST,  /* the key went down on the host through XTEST */
+};
+
+static typeof(XTestFakeKeyEvent) *pXTestFakeKeyEvent;
+static pthread_mutex_t xtest_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* the following are protected by xtest_mutex */
+static Display *xtest_display;
+static BOOL xtest_display_failed;
+static BYTE key_routes[256]; /* how keys down through SendInput were delivered, by keycode */
+
+/* XTEST doesn't release the keys of a client when it goes away, do it at exit */
+static void release_xtest_keys(void)
+{
+    unsigned int keyc;
+
+    /* a thread killed while forwarding input still holds the lock, leave the keys then */
+    if (pthread_mutex_trylock( &xtest_mutex )) return;
+    for (keyc = 0; keyc < ARRAY_SIZE(key_routes); keyc++)
+    {
+        if (key_routes[keyc] != KEY_ROUTE_XTEST) continue;
+        pXTestFakeKeyEvent( xtest_display, keyc, False, CurrentTime );
+        key_routes[keyc] = KEY_ROUTE_NONE;
+    }
+    XFlush( xtest_display );
+    pthread_mutex_unlock( &xtest_mutex );
+}
+
+/* XTEST input goes through a connection of its own, which only ever gets used with
+ * xtest_mutex held, so that release_xtest_keys can't wait on an Xlib lock left held by
+ * a killed thread. It is opened on first use, as most processes never forward input. */
+static BOOL open_xtest_display(void)
+{
+    if (xtest_display) return TRUE;
+    if (xtest_display_failed) return FALSE;
+    if (!(xtest_display = XOpenDisplay( NULL )))
+    {
+        WARN( "failed to open a display for XTEST, SendInput won't reach non-Wine windows\n" );
+        xtest_display_failed = TRUE;
+        return FALSE;
+    }
+    fcntl( ConnectionNumber(xtest_display), F_SETFD, 1 ); /* set close on exec flag */
+    atexit( release_xtest_keys );
+    return TRUE;
+}
+#endif
+
+/***********************************************************************
+ *		x11drv_xtest_init
+ */
+void x11drv_xtest_init( Display *display )
+{
+#ifdef SONAME_LIBXTST
+    typeof(XTestQueryExtension) *pXTestQueryExtension;
+    int event_base, error_base, major, minor;
+    void *handle;
+
+    if (!forward_send_input) return;
+    if (!(handle = dlopen( SONAME_LIBXTST, RTLD_NOW )))
+    {
+        WARN( "failed to load %s, SendInput won't reach non-Wine windows\n", SONAME_LIBXTST );
+        return;
+    }
+    pXTestQueryExtension = dlsym( handle, "XTestQueryExtension" );
+    pXTestFakeKeyEvent = dlsym( handle, "XTestFakeKeyEvent" );
+    if (!pXTestQueryExtension || !pXTestFakeKeyEvent ||
+        !pXTestQueryExtension( display, &event_base, &error_base, &major, &minor ))
+    {
+        WARN( "XTEST unavailable, SendInput won't reach non-Wine windows\n" );
+        pXTestFakeKeyEvent = NULL;
+        dlclose( handle );
+        return;
+    }
+    TRACE( "XTEST %d.%d\n", major, minor );
+#endif
+}
+
+#ifdef SONAME_LIBXTST
+/* X keycode for a SendInput keyboard event, 0 if the keyboard has no such key */
+static KeyCode keycode_from_input( const KEYBDINPUT *ki )
+{
+    BOOL extended = !!(ki->dwFlags & KEYEVENTF_EXTENDEDKEY);
+    unsigned int keyc, ret = 0;
+    KeySym keysym = NoSymbol;
+    WORD vkey, scan;
+
+    pthread_mutex_lock( &kbd_mutex );
+    if (ki->dwFlags & KEYEVENTF_SCANCODE)
+    {
+        /* an E0/E1 prefix in the high byte also marks the key extended */
+        if ((ki->wScan >> 8) == 0xe0 || (ki->wScan >> 8) == 0xe1) extended = TRUE;
+        scan = (ki->wScan & 0xff) | (extended ? 0x100 : 0);
+        for (keyc = min_keycode; keyc <= max_keycode && !ret; keyc++)
+            if (keyc2scan( keyc, 0 ) == scan) ret = keyc;
+        /* some callers flag keys like right shift as extended */
+        for (keyc = min_keycode; keyc <= max_keycode && !ret && extended; keyc++)
+            if (keyc2scan( keyc, 0 ) == (scan & 0xff)) ret = keyc;
+    }
+    else if ((vkey = ki->wVk & 0xff))
+    {
+        switch (vkey)
+        {
+        case VK_SHIFT: vkey = (ki->wScan & 0xff) == 0x36 ? VK_RSHIFT : VK_LSHIFT; break;
+        case VK_CONTROL: vkey = extended ? VK_RCONTROL : VK_LCONTROL; break;
+        case VK_MENU: vkey = extended ? VK_RMENU : VK_LMENU; break;
+        /* the keypad keys share these vkeys, but type digits with NumLock on, while
+         * the vkey alone picks the function on Windows, so use the cursor keys */
+        case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+        case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+        case VK_INSERT: case VK_DELETE:
+            extended = TRUE;
+            break;
+        }
+        /* keycodes get their vkeys with NumLock off, which leaves the keypad digits
+         * without any, find them by keysym (they need NumLock on in the host too) */
+        if (vkey >= VK_NUMPAD0 && vkey <= VK_NUMPAD9) keysym = XK_KP_0 + vkey - VK_NUMPAD0;
+        else if (vkey == VK_DECIMAL) keysym = XK_KP_Decimal;
+        /* otherwise, the extended flag tells keys apart, like the two Enter keys */
+        for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+        {
+            if ((keyc2vkey[keyc] & 0xff) != vkey) continue;
+            if (!ret) ret = keyc;
+            if (scan_is_extended( keyc2scan( keyc, 0 ) ) == extended)
+            {
+                ret = keyc;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock( &kbd_mutex );
+
+    if (!ret && keysym != NoSymbol)
+    {
+        ret = XKeysymToKeycode( gdi_display, keysym );
+        /* some layouts have a locale dependent separator on the keypad instead */
+        if (!ret && keysym == XK_KP_Decimal) ret = XKeysymToKeycode( gdi_display, XK_KP_Separator );
+    }
+    return ret;
+}
+#endif
+
+/***********************************************************************
+ *		ForwardInput (X11DRV.@)
+ *
+ * wineserver only delivers SendInput to windows of this desktop. When the
+ * host's active window belongs to another X client, replay keyboard input
+ * through XTEST so it lands there, as SendInput reaches the foreground
+ * window on Windows.
+ */
+BOOL X11DRV_ForwardInput( const INPUT *input )
+{
+#ifdef SONAME_LIBXTST
+    const KEYBDINPUT *ki = &input->ki;
+    BOOL down = !(ki->dwFlags & KEYEVENTF_KEYUP), ret = FALSE;
+    enum key_route route;
+    KeyCode keycode;
+
+    if (!pXTestFakeKeyEvent || input->type != INPUT_KEYBOARD) return FALSE;
+    if ((ki->dwFlags & KEYEVENTF_UNICODE) || !(keycode = keycode_from_input( ki )))
+    {
+        static BOOL warned;
+
+        /* XTEST can only press keys of the host keyboard, wineserver gets the rest */
+        if (down && !warned && host_active_window_is_foreign( gdi_display ))
+        {
+            FIXME_(key)( "can't forward vkey %#x scan %#x flags %#x to the host window\n",
+                         ki->wVk, ki->wScan, (int)ki->dwFlags );
+            warned = TRUE;
+        }
+        return FALSE;
+    }
+
+    pthread_mutex_lock( &xtest_mutex );
+    /* repeats and releases go the way the key went down, so that neither the host
+     * nor wineserver is left with it held when the host's active window changes */
+    if (!(route = key_routes[keycode]) && down)
+    {
+        if (host_active_window_is_foreign( gdi_display ) && open_xtest_display()) route = KEY_ROUTE_XTEST;
+        else route = KEY_ROUTE_SERVER;
+    }
+    key_routes[keycode] = down ? route : KEY_ROUTE_NONE;
+    if (route == KEY_ROUTE_XTEST)
+    {
+        pXTestFakeKeyEvent( xtest_display, keycode, down, CurrentTime );
+        XFlush( xtest_display );
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &xtest_mutex );
+
+    if (ret) TRACE_(key)( "forwarded keycode %u %s\n", keycode, down ? "down" : "up" );
+    return ret;
+#else
+    return FALSE;
+#endif
 }
 
 
