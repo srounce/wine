@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 110
+#define WINE_GDI_DRIVER_VERSION 111
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -378,6 +378,7 @@ struct user_driver_funcs
     SHORT   (*pVkKeyScanEx)(WCHAR, HKL);
     const KBDTABLES *(*pKbdLayerDescriptor)(HKL);
     void    (*pReleaseKbdTables)(const KBDTABLES *);
+    BOOL    (*pForwardInput)(const INPUT *);
     /* IME functions */
     UINT    (*pImeToAsciiEx)(UINT,UINT,const BYTE*,HIMC);
     void    (*pNotifyIMEStatus)(HWND,UINT);

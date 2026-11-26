@@ -789,6 +789,8 @@ UINT WINAPI NtUserSendInput( UINT count, INPUT *inputs, int size )
             update_mouse_coords( &input );
             /* fallthrough */
         case INPUT_KEYBOARD:
+            /* the driver delivers input meant for a host window outside this desktop */
+            if (user_driver->pForwardInput( &input )) break;
             status = server_send_hardware_message( 0, SEND_HWMSG_INJECTED, &input, 0 );
             break;
         case INPUT_HARDWARE:
