@@ -30,7 +30,7 @@ jobs:
           # without it configure silently skips them.
           sudo apt-get install -y flex bison gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            libusb-1.0-0-dev libudev-dev
+            libusb-1.0-0-dev libudev-dev libxtst-dev
 
       - name: Configure
         # A single WoW64 build: 64-bit host libraries serving both 64-bit and

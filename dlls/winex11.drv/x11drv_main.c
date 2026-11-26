@@ -72,6 +72,7 @@ BOOL use_take_focus = TRUE;
 BOOL use_primary_selection = FALSE;
 BOOL use_system_cursors = TRUE;
 BOOL grab_fullscreen = FALSE;
+BOOL forward_send_input = TRUE;
 BOOL managed_mode = TRUE;
 BOOL private_color_map = FALSE;
 int primary_monitor = 0;
@@ -492,6 +493,9 @@ static void setup_options(void)
     if (!get_config_key( hkey, appkey, "GrabFullscreen", buffer, sizeof(buffer) ))
         grab_fullscreen = IS_OPTION_TRUE( buffer[0] );
 
+    if (!get_config_key( hkey, appkey, "ForwardSendInput", buffer, sizeof(buffer) ))
+        forward_send_input = IS_OPTION_TRUE( buffer[0] );
+
     if (!get_config_key( hkey, appkey, "ScreenDepth", buffer, sizeof(buffer) ))
         default_visual.depth = wcstol( buffer, NULL, 0 );
 
@@ -693,6 +697,7 @@ NTSTATUS __wine_unix_lib_init(void)
     x11drv_xinput2_load();
 
     x11drv_init_keyboard( gdi_display );
+    x11drv_xtest_init( gdi_display );
     x11drv_init_mouse( gdi_display );
     if (use_xim) use_xim = xim_init( input_style );
 

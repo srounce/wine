@@ -1243,6 +1243,8 @@ void X11DRV_ActivateWindow( HWND hwnd, HWND previous )
     struct x11drv_win_data *data;
     BOOL flush = FALSE;
 
+    note_window_activation( hwnd );
+
     if (!is_virtual_desktop())
     {
         set_net_active_window( hwnd, previous );

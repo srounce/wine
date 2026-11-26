@@ -211,6 +211,7 @@ extern UINT X11DRV_MapVirtualKeyEx( UINT code, UINT map_type, HKL hkl );
 extern INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
                                LPWSTR bufW, int bufW_size, UINT flags, HKL hkl );
 extern SHORT X11DRV_VkKeyScanEx( WCHAR wChar, HKL hkl );
+extern BOOL X11DRV_ForwardInput( const INPUT *input );
 extern void X11DRV_NotifyIMEStatus( HWND hwnd, UINT status );
 extern BOOL X11DRV_SetIMECompositionRect( HWND hwnd, RECT rect );
 extern void X11DRV_DestroyCursorIcon( HCURSOR handle );
@@ -486,6 +487,7 @@ extern BOOL use_take_focus;
 extern BOOL use_primary_selection;
 extern BOOL use_system_cursors;
 extern BOOL grab_fullscreen;
+extern BOOL forward_send_input;
 extern BOOL usexcomposite;
 extern BOOL managed_mode;
 extern BOOL private_color_map;
@@ -735,6 +737,8 @@ extern void window_configure_notify( struct x11drv_win_data *data, unsigned long
 
 extern void set_net_active_window( HWND hwnd, HWND previous );
 extern Window get_net_active_window( Display *display );
+extern void note_window_activation( HWND hwnd );
+extern BOOL host_active_window_is_foreign( Display *display );
 extern void net_active_window_notify( unsigned long serial, Window window, Time time );
 extern void net_active_window_init( struct x11drv_thread_data *data );
 extern void net_supported_init( struct x11drv_thread_data *data );
@@ -774,6 +778,7 @@ extern void reapply_cursor_clipping(void);
 extern void ungrab_clipping_window(void);
 extern void move_resize_window( HWND hwnd, int dir, POINT pos );
 extern void x11drv_init_keyboard( Display *display );
+extern void x11drv_xtest_init( Display *display );
 extern void x11drv_init_mouse( Display *display );
 extern BOOL X11DRV_ProcessEvents( DWORD mask );
 

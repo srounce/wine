@@ -82,6 +82,8 @@ AC_ARG_WITH(xshape,    AS_HELP_STRING([--without-xshape],[do not use the Xshape 
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_shape_h=no; fi])
 AC_ARG_WITH(xshm,      AS_HELP_STRING([--without-xshm],[do not use XShm (shared memory extension)]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_XShm_h=no; fi])
+AC_ARG_WITH(xtest,     AS_HELP_STRING([--without-xtest],[do not use XTest (SendInput to non-Wine windows)]),
+            [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_XTest_h=no; fi])
 AC_ARG_WITH(xxf86vm,   AS_HELP_STRING([--without-xxf86vm],[do not use XFree video mode extension]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_xf86vmode_h=no; ac_cv_header_X11_extensions_xf86vmproto_h=no; fi])
 
@@ -1397,6 +1399,13 @@ then
                         [$xlib_includes])
         WINE_NOTICE_WITH(xcomposite,[test "x$ac_cv_lib_soname_Xcomposite" = "x"],
                          [libxcomposite ${notice_platform}development files not found, Xcomposite won't be supported.])
+
+        dnl *** Check for XTest extension
+        AC_CHECK_HEADER([X11/extensions/XTest.h],
+                        [WINE_CHECK_SONAME(Xtst,XTestFakeKeyEvent,,,[$X_LIBS])],,
+                        [$xlib_includes])
+        WINE_NOTICE_WITH(xtest,[test "x$ac_cv_lib_soname_Xtst" = "x"],
+                         [libxtst ${notice_platform}development files not found, SendInput won't reach non-Wine windows.])
 
         dnl *** Check for XICCallback struct
         AC_CHECK_MEMBERS([XICCallback.callback, XEvent.xcookie],,,[$xlib_includes])

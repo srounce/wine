@@ -982,6 +982,7 @@ with_xrandr
 with_xrender
 with_xshape
 with_xshm
+with_xtest
 with_xxf86vm
 with_system_dllpath
 with_wine_tools
@@ -2653,6 +2654,7 @@ Optional Packages:
   --without-xrender       do not use the Xrender extension
   --without-xshape        do not use the Xshape extension
   --without-xshm          do not use XShm (shared memory extension)
+  --without-xtest         do not use XTest (SendInput to non-Wine windows)
   --without-xxf86vm       do not use XFree video mode extension
   --with-system-dllpath=PATH
                           load external PE dependencies from colon-separated
@@ -4585,6 +4587,13 @@ fi
 if test ${with_xshm+y}
 then :
   withval=$with_xshm; if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_XShm_h=no; fi
+fi
+
+
+# Check whether --with-xtest was given.
+if test ${with_xtest+y}
+then :
+  withval=$with_xtest; if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_XTest_h=no; fi
 fi
 
 
@@ -16239,6 +16248,86 @@ then :
   xno) ;;
   *)   as_fn_error $? "libxcomposite ${notice_platform}development files not found, Xcomposite won't be supported.
 This is an error since --with-xcomposite was requested." "$LINENO" 5 ;;
+esac
+
+fi
+
+                ac_fn_c_check_header_compile "$LINENO" "X11/extensions/XTest.h" "ac_cv_header_X11_extensions_XTest_h" "$xlib_includes
+"
+if test "x$ac_cv_header_X11_extensions_XTest_h" = xyes
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for -lXtst" >&5
+printf %s "checking for -lXtst... " >&6; }
+if test ${ac_cv_lib_soname_Xtst+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lXtst $X_LIBS $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char XTestFakeKeyEvent (void);
+int
+main (void)
+{
+return XTestFakeKeyEvent ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_Xtst=`$ac_cv_path_LDD conftest.exe | grep "Xtst" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_Xtst=`$OTOOL -L conftest$ac_exeext | grep "libXtst\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libXtst\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_Xtst=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libXtst\\.$LIBEXT" | sed -e "s/^.*\\[\\(libXtst\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_Xtst:+false} :
+then :
+  ac_cv_lib_soname_Xtst=`$LDD conftest$ac_exeext | grep "libXtst\\.$LIBEXT" | sed -e "s/^.*\(libXtst\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_Xtst= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_Xtst:+false} :
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf '%s\n' "not found" >&6; }
+
+else case e in #(
+  e) { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_Xtst" >&5
+printf '%s\n' "$ac_cv_lib_soname_Xtst" >&6; }
+
+printf '%s\n' "#define SONAME_LIBXTST \"$ac_cv_lib_soname_Xtst\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+        if test "x$ac_cv_lib_soname_Xtst" = "x"
+then :
+  case "x$with_xtest" in
+  x)   as_fn_append wine_notices "|libxtst ${notice_platform}development files not found, SendInput won't reach non-Wine windows." ;;
+  xno) ;;
+  *)   as_fn_error $? "libxtst ${notice_platform}development files not found, SendInput won't reach non-Wine windows.
+This is an error since --with-xtest was requested." "$LINENO" 5 ;;
 esac
 
 fi

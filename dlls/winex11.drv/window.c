@@ -2075,11 +2075,75 @@ Window get_net_active_window( Display *display )
                              65536 / sizeof(Window), False, XA_WINDOW, &type, &format, &count,
                              &remaining, (unsigned char **)&value ))
     {
-        if (type == XA_WINDOW && format == 32) window = *value;
+        if (type == XA_WINDOW && format == 32 && count) window = *value;
         XFree( value );
     }
 
     return window;
+}
+
+/* how long the window manager gets to activate a window Wine activated, in ms */
+#define ACTIVATION_GRACE_TIME 1000
+
+static pthread_mutex_t activation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static HWND activation_hwnd;  /* window Wine last activated, protected by activation_mutex */
+static ULONG activation_time; /* when it did, protected by activation_mutex */
+
+/***********************************************************************
+ *              note_window_activation
+ *
+ * Remember that Wine activated a window, which the host follows later.
+ */
+void note_window_activation( HWND hwnd )
+{
+    pthread_mutex_lock( &activation_mutex );
+    activation_hwnd = hwnd;
+    activation_time = NtGetTickCount();
+    pthread_mutex_unlock( &activation_mutex );
+}
+
+static BOOL activation_pending( HWND hwnd )
+{
+    BOOL ret;
+
+    pthread_mutex_lock( &activation_mutex );
+    ret = hwnd == activation_hwnd && NtGetTickCount() - activation_time < ACTIVATION_GRACE_TIME;
+    pthread_mutex_unlock( &activation_mutex );
+    return ret;
+}
+
+/***********************************************************************
+ *              host_active_window_is_foreign
+ *
+ * Whether the host's active window is outside this desktop: a native program,
+ * or a Wine program of another prefix or desktop.
+ */
+BOOL host_active_window_is_foreign( Display *display )
+{
+    HWND foreground = NtUserGetForegroundWindow();
+    Window window;
+    int revert;
+
+    if (foreground == NtUserGetDesktopWindow()) foreground = 0;
+
+    if (!(window = get_net_active_window( display )))
+    {
+        /* no EWMH window manager, use the input focus instead */
+        XGetInputFocus( display, &window, &revert );
+        /* XTEST input goes to the window under the pointer then, maybe a native one */
+        if (window == PointerRoot) return TRUE;
+        /* or nowhere without any focus, let wineserver have it instead */
+        if (!window) return FALSE;
+    }
+
+    if (is_virtual_desktop() && window == root_window) return FALSE;
+    if (foreground && window == X11DRV_get_whole_window( foreground )) return FALSE;
+    /* the window manager hasn't caught up with Wine activating a window, which
+     * wineserver already delivers input to */
+    if (foreground && activation_pending( foreground )) return FALSE;
+    /* X delivers XTEST input to any other window, including Wine windows that
+     * aren't foreground (yet), which then get it as host input */
+    return TRUE;
 }
 
 void net_active_window_init( struct x11drv_thread_data *data )
